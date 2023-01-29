@@ -155,8 +155,6 @@ agent_listen_loop()
 			verbose("client pid %d connected", client_pid);
 			if (debug_mode) {
 				agent_process_connection(con);
-				agent_cleanup();
-				return;
 			} else {
 				/* spawn a child to take care of this*/
 				wchar_t path[PATH_MAX], module_path[PATH_MAX];
