@@ -63,58 +63,11 @@ struct pkcs11_provider {
 
 TAILQ_HEAD(, pkcs11_provider) pkcs11_providers;
 
-struct pkcs11_keyinfo {
-	struct sshkey	*key;
-	char		*providername, *label;
-	TAILQ_ENTRY(pkcs11_keyinfo) next;
-};
-
-TAILQ_HEAD(, pkcs11_keyinfo) pkcs11_keylist;
-
 #define MAX_MSG_LENGTH		10240 /*XXX*/
 
 /* input and output queue */
 struct sshbuf *iqueue;
 struct sshbuf *oqueue;
-
-void
-add_key(struct sshkey *k, char *name)
-{
-	struct pkcs11_keyinfo *ki;
-
-	ki = xcalloc(1, sizeof(*ki));
-	ki->providername = xstrdup(name);
-	ki->key = k;
-	TAILQ_INSERT_TAIL(&pkcs11_keylist, ki, next);
-}
-
-void
-del_all_keys()
-{
-	struct pkcs11_keyinfo *ki, *nxt;
-
-	for (ki = TAILQ_FIRST(&pkcs11_keylist); ki; ki = nxt) {
-		nxt = TAILQ_NEXT(ki, next);
-		TAILQ_REMOVE(&pkcs11_keylist, ki, next);
-		free(ki->providername);
-		sshkey_free(ki->key);
-		free(ki);
-	}
-}
-
-/* lookup matching 'private' key */
-struct sshkey *
-lookup_key(const struct sshkey *k)
-{
-	struct pkcs11_keyinfo *ki;
-
-	TAILQ_FOREACH(ki, &pkcs11_keylist, next) {
-		debug("check %p %s %s", ki, ki->providername, ki->label);
-		if (sshkey_equal(k, ki->key))
-			return (ki->key);
-	}
-	return (NULL);
-}
 
 static char *
 find_helper_in_module_path(void)
@@ -227,7 +180,6 @@ pkcs11_init(int interactive)
 {
 #ifdef WINDOWS
 	TAILQ_INIT(&pkcs11_providers);
-	TAILQ_INIT(&pkcs11_keylist);
 #endif /* WINDOWS */
 	return (0);
 }

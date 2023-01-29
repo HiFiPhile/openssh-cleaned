@@ -60,21 +60,6 @@ struct idtable {
 /* private key table */
 struct idtable* idtab;
 
-/* 
- * get registry root where keys are stored 
- * user keys are stored in user's hive
- * while system keys (host keys) in HKLM
- */
-
-extern struct sshkey *
-lookup_key(const struct sshkey *k);
-
-extern void
-add_key(struct sshkey *k, char *name);
-
-extern void
-del_all_keys();
-
 void
 idtab_init(void)
 {
@@ -105,77 +90,23 @@ free_identity(Identity* id)
 	free(id);
 }
 
-static int
-get_user_root(struct agent_connection* con, HKEY *root)
+static char*
+agent_decode_alg(struct sshkey* key, u_int flags)
 {
-	int r = 0;
-	LONG ret;
-	*root = HKEY_LOCAL_MACHINE;
-	
-	if (con->client_type <= ADMIN_USER) {
-		if (ImpersonateLoggedOnUser(con->client_impersonation_token) == FALSE)
-			return -1;
-		*root = NULL;
-		/* 
-		 * TODO - check that user profile is loaded, 
-		 * otherwise, this will return default profile 
-		 */
-		if ((ret = RegOpenCurrentUser(KEY_ALL_ACCESS, root)) != ERROR_SUCCESS) {
-			debug("unable to open user's registry hive, ERROR - %d", ret);
-			r = -1;
-		}
-			
-		RevertToSelf();
+	if (key->type == KEY_RSA) {
+		if (flags & SSH_AGENT_RSA_SHA2_256)
+			return "rsa-sha2-256";
+		else if (flags & SSH_AGENT_RSA_SHA2_512)
+			return "rsa-sha2-512";
 	}
-	return r;
+	else if (key->type == KEY_RSA_CERT) {
+		if (flags & SSH_AGENT_RSA_SHA2_256)
+			return "rsa-sha2-256-cert-v01@openssh.com";
+		else if (flags & SSH_AGENT_RSA_SHA2_512)
+			return "rsa-sha2-512-cert-v01@openssh.com";
+	}
+	return NULL;
 }
-
-static int
-convert_blob(struct agent_connection* con, const char *blob, DWORD blen, char **eblob, DWORD *eblen, int encrypt) {
-	int success = 0;
-	DATA_BLOB in, out;
-	errno_t r = 0;
-
-	if (con->client_type <= ADMIN_USER)
-		if (ImpersonateLoggedOnUser(con->client_impersonation_token) == FALSE)
-			return -1;
-
-	in.cbData = blen;
-	in.pbData = (char*)blob;
-	out.cbData = 0;
-	out.pbData = NULL;
-
-	if (encrypt) {
-		if (!CryptProtectData(&in, NULL, NULL, 0, NULL, 0, &out)) {
-			debug("cannot encrypt data");
-			goto done;
-		}
-	} else {
-		if (!CryptUnprotectData(&in, NULL, NULL, 0, NULL, 0, &out)) {
-			debug("cannot decrypt data");
-			goto done;
-		}
-	}
-
-	*eblob = malloc(out.cbData);
-	if (*eblob == NULL) 
-		goto done;
-
-	if((r = memcpy_s(*eblob, out.cbData, out.pbData, out.cbData)) != 0) {
-		debug("memcpy_s failed with error: %d.", r);
-		goto done;
-	}
-	*eblen = out.cbData;
-	success = 1;
-done:
-	if (out.pbData)
-		LocalFree(out.pbData);
-	if (con->client_type <= ADMIN_USER)
-		RevertToSelf();
-	return success? 0: -1;
-}
-
-#define REG_KEY_SDDL L"D:P(A;; GA;;; SY)(A;; GA;;; BA)"
 
 int
 process_unsupported_request(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con)
@@ -222,7 +153,7 @@ process_add_identity(struct sshbuf* request, struct sshbuf* response, struct age
 
 	if ((fp = sshkey_fingerprint(key, SSH_FP_HASH_DEFAULT,
 		SSH_FP_DEFAULT)) == NULL)
-		fatal_f("sshkey_fingerprint failed");
+		fatal("sshkey_fingerprint failed");
 
 	free(fp);
 
@@ -244,174 +175,47 @@ done:
 	return r;
 }
 
-static int sign_blob(const struct sshkey *pubkey, u_char ** sig, size_t *siglen,
-	const u_char *blob, size_t blen, u_int flags, struct agent_connection* con) 
-{
-	HKEY reg = 0, sub = 0, user_root = 0;
-	int r = 0, success = 0;
-	struct sshkey* prikey = NULL;
-	char *thumbprint = NULL, *regdata = NULL, *algo = NULL;
-	DWORD regdatalen = 0, keyblob_len = 0;
-	struct sshbuf* tmpbuf = NULL;
-	char *keyblob = NULL;
-	const char *sk_provider = NULL;
-#ifdef ENABLE_PKCS11
-	int is_pkcs11_key = 0;
-#endif /* ENABLE_PKCS11 */
-
-	*sig = NULL;
-	*siglen = 0;
-
-#ifdef ENABLE_PKCS11
-	if ((prikey = lookup_key(pubkey)) == NULL) {
-#endif /* ENABLE_PKCS11 */
-		if ((thumbprint = sshkey_fingerprint(pubkey, SSH_FP_HASH_DEFAULT, SSH_FP_DEFAULT)) == NULL ||
-			get_user_root(con, &user_root) != 0 ||
-			RegOpenKeyExW(user_root, SSH_KEYS_ROOT,
-				0, STANDARD_RIGHTS_READ | KEY_QUERY_VALUE | KEY_WOW64_64KEY | KEY_ENUMERATE_SUB_KEYS, &reg) != 0 ||
-			RegOpenKeyExA(reg, thumbprint, 0,
-				STANDARD_RIGHTS_READ | KEY_QUERY_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &sub) != 0 ||
-			RegQueryValueExW(sub, NULL, 0, NULL, NULL, &regdatalen) != ERROR_SUCCESS ||
-			(regdata = malloc(regdatalen)) == NULL ||
-			RegQueryValueExW(sub, NULL, 0, NULL, regdata, &regdatalen) != ERROR_SUCCESS ||
-			convert_blob(con, regdata, regdatalen, &keyblob, &keyblob_len, FALSE) != 0 ||
-			(tmpbuf = sshbuf_from(keyblob, keyblob_len)) == NULL ||
-			sshkey_private_deserialize(tmpbuf, &prikey) != 0) {
-				error("cannot retrieve and deserialize key from registry");
-				goto done;
-			}
-#ifdef ENABLE_PKCS11
-	}
-	else
-		is_pkcs11_key = 1;
-#endif /* ENABLE_PKCS11 */
-	if (flags & SSH_AGENT_RSA_SHA2_256)
-		algo = "rsa-sha2-256";
-	else if (flags & SSH_AGENT_RSA_SHA2_512)
-		algo = "rsa-sha2-512";
-
-	if (sshkey_is_sk(prikey))
-		sk_provider = "internal";
-	if (sshkey_sign(prikey, sig, siglen, blob, blen, algo, sk_provider, NULL, 0) != 0) {
-		error("cannot sign using retrieved key");
-		goto done;
-	}
-
-	success = 1;
-
-done:
-	if (keyblob)
-		free(keyblob);
-	if (regdata)
-		free(regdata);
-	if (tmpbuf)
-		sshbuf_free(tmpbuf);
-#ifdef ENABLE_PKCS11
-	if (!is_pkcs11_key)
-#endif /* ENABLE_PKCS11 */
-		if (prikey)
-			sshkey_free(prikey);
-	if (thumbprint)
-		free(thumbprint);
-	if (user_root)
-		RegCloseKey(user_root);
-	if (reg)
-		RegCloseKey(reg);
-	if (sub)
-		RegCloseKey(sub);
-
-	return success ? 0 : -1;
-}
-
 int
 process_sign_request(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
 {
-	u_char *blob, *data, *signature = NULL;
+	u_char* blob, * data, * signature = NULL;
 	size_t blen, dlen, slen = 0;
 	u_int flags = 0;
+	char* fp = NULL;
 	int r, request_invalid = 0, success = 0;
-	struct sshkey *key = NULL;
-
-#ifdef ENABLE_PKCS11
-	int i, count = 0, index = 0;;
-	wchar_t sub_name[MAX_KEY_LENGTH];
-	DWORD sub_name_len = MAX_KEY_LENGTH;
-	DWORD pin_len, epin_len, provider_len;
-	char *pin = NULL, *npin = NULL, *epin = NULL, *provider = NULL;
-	HKEY root = 0, sub = 0, user_root = 0;
-	struct sshkey **keys = NULL;
-	SECURITY_ATTRIBUTES sa = { 0, NULL, 0 };
-
-	pkcs11_init(0);
-
-	memset(&sa, 0, sizeof(SECURITY_ATTRIBUTES));
-	sa.nLength = sizeof(sa);
-	if ((!ConvertStringSecurityDescriptorToSecurityDescriptorW(REG_KEY_SDDL, SDDL_REVISION_1, &sa.lpSecurityDescriptor, &sa.nLength)) ||
-		get_user_root(con, &user_root) != 0 ||
-		RegCreateKeyExW(user_root, SSH_PKCS11_PROVIDERS_ROOT, 0, 0, 0, KEY_WRITE | STANDARD_RIGHTS_READ | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &sa, &root, NULL) != 0) {
-		goto done;
-	}
-
-	while (1) {
-		sub_name_len = MAX_KEY_LENGTH;
-		if (sub) {
-			RegCloseKey(sub);
-			sub = NULL;
-		}
-		if (RegEnumKeyExW(root, index++, sub_name, &sub_name_len, NULL, NULL, NULL, NULL) == 0) {
-			if (RegOpenKeyExW(root, sub_name, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &sub) == 0 &&
-				RegQueryValueExW(sub, L"provider", 0, NULL, NULL, &provider_len) == 0 &&
-				RegQueryValueExW(sub, L"pin", 0, NULL, NULL, &epin_len) == 0) {
-				if ((epin = malloc(epin_len + 1)) == NULL ||
-					(provider = malloc(provider_len + 1)) == NULL ||
-					RegQueryValueExW(sub, L"provider", 0, NULL, provider, &provider_len) != 0 ||
-					RegQueryValueExW(sub, L"pin", 0, NULL, epin, &epin_len) != 0)
-					goto done;
-				provider[provider_len] = '\0';
-				epin[epin_len] = '\0';
-				if (convert_blob(con, epin, epin_len, &pin, &pin_len, 0) != 0 ||
-					(npin = realloc(pin, pin_len + 1)) == NULL) {
-					goto done;
-				}
-				pin = npin;
-				pin[pin_len] = '\0';
-				count = pkcs11_add_provider(provider, pin, &keys, NULL);
-				for (i = 0; i < count; i++) {
-					add_key(keys[i], provider);
-				}
-				free(keys);
-				if (provider)
-					free(provider);
-				if (pin) {
-					SecureZeroMemory(pin, (DWORD)pin_len);
-					free(pin);
-				}
-				if (epin) {
-					SecureZeroMemory(epin, (DWORD)epin_len);
-					free(epin);
-				}
-				provider = NULL;
-				pin = NULL;
-				epin = NULL;
-			}
-		}
-		else
-			break;
-	}
-#endif /* ENABLE_PKCS11 */
+	struct sshkey* key = NULL;
+	struct identity* id;
+	const char* sk_provider = NULL;
 
 	if (sshbuf_get_string_direct(request, &blob, &blen) != 0 ||
-	    sshbuf_get_string_direct(request, &data, &dlen) != 0 ||
-	    sshbuf_get_u32(request, &flags) != 0 ||
-	    sshkey_from_blob(blob, blen, &key) != 0) {
+		sshbuf_get_string_direct(request, &data, &dlen) != 0 ||
+		sshbuf_get_u32(request, &flags) != 0 ||
+		sshkey_from_blob(blob, blen, &key) != 0) {
 		debug("sign request is invalid");
 		request_invalid = 1;
 		goto done;
 	}
 
-	if (sign_blob(key, &signature, &slen, data, dlen, flags, con) != 0)
+	if ((id = lookup_identity(key)) == NULL) {
+		verbose_f("%s key not found", sshkey_type(key));
 		goto done;
+	}
 
+	if ((fp = sshkey_fingerprint(key, SSH_FP_HASH_DEFAULT,
+		SSH_FP_DEFAULT)) == NULL) {
+		fatal("fingerprint failed");
+		goto done;
+	}
+
+	if (sshkey_is_sk(key))
+		sk_provider = "internal";
+	
+	if ((r = sshkey_sign(id->key, &signature, &slen, data, dlen,
+		agent_decode_alg(key, flags), sk_provider, NULL, 0)) != 0) {
+			error("cannot sign using retrieved key");
+			goto done;
+	}
+	/* Success */
 	success = 1;
 done:
 	r = 0;
@@ -431,26 +235,7 @@ done:
 		sshkey_free(key);
 	if (signature)
 		free(signature);
-#ifdef ENABLE_PKCS11
-	del_all_keys();
-	pkcs11_terminate();
-	if (provider)
-		free(provider);
-	if (pin) {
-		SecureZeroMemory(pin, (DWORD)pin_len);
-		free(pin);
-	}
-	if (epin) {
-		SecureZeroMemory(epin, (DWORD)epin_len);
-		free(epin);
-	}
-	if (user_root)
-		RegCloseKey(user_root);
-	if (root)
-		RegCloseKey(root);
-	if (sub)
-		RegCloseKey(sub);
-#endif /* ENABLE_PKCS11 */
+
 	return r;
 }
 
