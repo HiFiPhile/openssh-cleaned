@@ -60,6 +60,6 @@ void agent_connection_on_error(struct agent_connection* , DWORD);
 void agent_connection_disconnect(struct agent_connection*);
 
 void agent_start(BOOL);
-void agent_process_connection(HANDLE);
+DWORD agent_process_connection(LPVOID);
 void agent_shutdown();
 void agent_cleanup_connection(struct agent_connection*);

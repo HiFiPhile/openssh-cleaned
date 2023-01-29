@@ -156,32 +156,14 @@ agent_listen_loop()
 			pipe = INVALID_HANDLE_VALUE;
 			GetNamedPipeClientProcessId(con, &client_pid);
 			verbose("client pid %d connected", client_pid);
-			if (debug_mode) {
-				agent_process_connection(con);
-			} else {
-				/* spawn a child to take care of this*/
-				wchar_t path[PATH_MAX], module_path[PATH_MAX];
-				PROCESS_INFORMATION pi;
-				STARTUPINFOW si;
-
-				si.cb = sizeof(STARTUPINFOW);
-				memset(&si, 0, sizeof(STARTUPINFOW));
-				GetModuleFileNameW(NULL, module_path, PATH_MAX);
-				SetHandleInformation(con, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT);
-				if ((swprintf_s(path, PATH_MAX, L"%s %d", module_path, (int)(intptr_t)con) == -1 ) ||
-				    (CreateProcessW(NULL, path, NULL, NULL, TRUE,
-					DETACHED_PROCESS, NULL, NULL,
-					&si, &pi) == FALSE)) {
-					verbose("Failed to create child process %ls ERROR:%d", module_path, GetLastError());
-				} else {
-					debug("spawned worker %d for agent client pid %d ", pi.dwProcessId, client_pid);
-					CloseHandle(pi.hProcess);
-					CloseHandle(pi.hThread);
-				}
-				SetHandleInformation(con, HANDLE_FLAG_INHERIT, 0);
-				CloseHandle(con);				
-			}
-			
+			//if (debug_mode) {
+			agent_process_connection(con);
+			/* termio doesn't work with multithread */
+			//} else {
+			//	/* spawn a child to take care of this*/
+			//	CreateThread(NULL, 0, agent_process_connection, con, 0, NULL);
+			//	debug("spawned worker for agent client pid %d ", client_pid);
+			//}
 		} else {
 			fatal("wait on events ended with %d ERROR:%d", r, GetLastError());
 		}
@@ -382,8 +364,8 @@ done:
 	return r;
 }
 
-void 
-agent_process_connection(HANDLE pipe) 
+DWORD 
+agent_process_connection(LPVOID pipe) 
 {
 	struct agent_connection* con;
 	verbose("%s pipe:%p", __FUNCTION__, pipe);
