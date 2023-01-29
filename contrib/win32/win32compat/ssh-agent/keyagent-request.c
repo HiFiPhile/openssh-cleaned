@@ -136,6 +136,10 @@ process_add_identity(struct sshbuf* request, struct sshbuf* response, struct age
 		goto done;
 	}
 
+	/* Shield key again with DPAPI */
+	CryptProtectMemory(key->shielded_private, (DWORD)key->shielded_len, CRYPTPROTECTMEMORY_SAME_PROCESS);
+	CryptProtectMemory(key->shield_prekey, (DWORD)key->shield_prekey_len, CRYPTPROTECTMEMORY_SAME_PROCESS);
+
 	if ((id = lookup_identity(key)) == NULL) {
 		id = xcalloc(1, sizeof(Identity));
 		TAILQ_INSERT_TAIL(&idtab->idlist, id, next);
@@ -206,6 +210,10 @@ process_sign_request(struct sshbuf* request, struct sshbuf* response, struct age
 	if (sshkey_is_sk(key))
 		sk_provider = "internal";
 	
+	/* Un-shield key with DPAPI */
+	CryptUnprotectMemory(id->key->shielded_private, (DWORD)id->key->shielded_len, CRYPTPROTECTMEMORY_SAME_PROCESS);
+	CryptUnprotectMemory(id->key->shield_prekey, (DWORD)id->key->shield_prekey_len, CRYPTPROTECTMEMORY_SAME_PROCESS);
+
 	if ((r = sshkey_sign(id->key, &signature, &slen, data, dlen,
 		agent_decode_alg(key, flags), sk_provider, NULL, 0)) != 0) {
 			error("cannot sign using retrieved key");
@@ -214,6 +222,12 @@ process_sign_request(struct sshbuf* request, struct sshbuf* response, struct age
 	/* Success */
 	success = 1;
 done:
+	if (id) {
+		/* Shield key again with DPAPI */
+		CryptProtectMemory(id->key->shielded_private, (DWORD)id->key->shielded_len, CRYPTPROTECTMEMORY_SAME_PROCESS);
+		CryptProtectMemory(id->key->shield_prekey, (DWORD)id->key->shield_prekey_len, CRYPTPROTECTMEMORY_SAME_PROCESS);
+	}
+
 	r = 0;
 	if (request_invalid)
 		r = -1;
