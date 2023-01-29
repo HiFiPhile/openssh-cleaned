@@ -39,7 +39,7 @@
     <ProjectGuid>{21D772C3-0EB0-47B7-A93C-FF624675A58D}</ProjectGuid>
     <Keyword>Win32Proj</Keyword>
     <RootNamespace>sshpkcs11helper</RootNamespace>
-    <WindowsTargetPlatformVersion>$(WindowsSDKVersion)</WindowsTargetPlatformVersion>
+    <WindowsTargetPlatformVersion>10.0.17763.0</WindowsTargetPlatformVersion>
     <ProjectName>ssh-pkcs11-helper</ProjectName>
   </PropertyGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.Default.props" />

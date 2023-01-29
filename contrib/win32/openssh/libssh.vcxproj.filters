@@ -119,9 +119,6 @@
     <ClCompile Include="$(OpenSSH-Src-Path)cipher-chachapoly.c">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="$(OpenSSH-Src-Path)cipher-ctr.c">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="$(OpenSSH-Src-Path)cipher.c">
       <Filter>Source Files</Filter>
     </ClCompile>
