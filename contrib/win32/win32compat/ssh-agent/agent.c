@@ -55,6 +55,9 @@ static struct hostkey_sid *session_ids;
 static struct dest_constraint *dest_constraints;
 static size_t ndest_constraints;
 
+extern void
+idtab_init(void);
+
 static void
 agent_cleanup() 
 {
@@ -239,6 +242,11 @@ agent_start(BOOL dbg_mode)
 
 	memset(&sa, 0, sizeof(SECURITY_ATTRIBUTES));
 	sa.nLength = sizeof(sa);
+
+	idtab_init();
+#ifdef ENABLE_PKCS11
+	pkcs11_init(0);
+#endif /* ENABLE_PKCS11 */
 
 	// SDDL - FullAcess to System and Builtin/Admins
 	sddl_str = L"D:PAI(A;OICI;KA;;;SY)(A;OICI;KA;;;BA)";

@@ -31,6 +31,7 @@
 
 #include "agent.h"
 #include "agent-request.h"
+#include "openbsd-compat/sys-queue.h"
 #include "config.h"
 #include <sddl.h>
 #ifdef ENABLE_PKCS11
@@ -43,6 +44,21 @@
 #define MAX_KEY_LENGTH 255
 #define MAX_VALUE_NAME_LENGTH 16383
 #define MAX_VALUE_DATA_LENGTH 2048
+
+typedef struct identity {
+	TAILQ_ENTRY(identity) next;
+	struct sshkey* key;
+	char* comment;
+	char* provider;
+} Identity;
+
+struct idtable {
+	int nentries;
+	TAILQ_HEAD(idqueue, identity) idlist;
+};
+
+/* private key table */
+struct idtable* idtab;
 
 /* 
  * get registry root where keys are stored 
@@ -58,6 +74,36 @@ add_key(struct sshkey *k, char *name);
 
 extern void
 del_all_keys();
+
+void
+idtab_init(void)
+{
+	idtab = xcalloc(1, sizeof(*idtab));
+	TAILQ_INIT(&idtab->idlist);
+	idtab->nentries = 0;
+}
+
+/* return matching private key for given public key */
+static Identity*
+lookup_identity(struct sshkey* key)
+{
+	Identity* id;
+
+	TAILQ_FOREACH(id, &idtab->idlist, next) {
+		if (sshkey_equal(key, id->key))
+			return (id);
+	}
+	return (NULL);
+}
+
+static void
+free_identity(Identity* id)
+{
+	sshkey_free(id->key);
+	free(id->provider);
+	free(id->comment);
+	free(id);
+}
 
 static int
 get_user_root(struct agent_connection* con, HKEY *root)
@@ -129,89 +175,6 @@ done:
 	return success? 0: -1;
 }
 
-/*
- * in user_root sub tree under key_name key
- * remove all sub keys with value name value_name_to_remove
- * and value data value_data_to_remove
- */
-static int
-remove_matching_subkeys_from_registry(HKEY user_root, wchar_t const* key_name, wchar_t const* value_name_to_remove, char const* value_data_to_remove) {
-	int index = 0, success = 0;
-	DWORD data_len;
-	HKEY root = 0, sub = 0;
-	char *data = NULL;
-	wchar_t sub_name[MAX_KEY_LENGTH];
-	DWORD sub_name_len = MAX_KEY_LENGTH;
-	LSTATUS retCode;
-
-	if (RegOpenKeyExW(user_root, key_name, 0, DELETE | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &root) != 0) {
-		goto done;
-	}
-
-	while (1) {
-		sub_name_len = MAX_KEY_LENGTH;
-		if (sub) {
-			RegCloseKey(sub);
-			sub = NULL;
-		}
-		if ((retCode = RegEnumKeyExW(root, index++, sub_name, &sub_name_len, NULL, NULL, NULL, NULL)) == 0) {
-			if (RegOpenKeyExW(root, sub_name, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &sub) == 0 &&
-				RegQueryValueExW(sub, value_name_to_remove, 0, NULL, NULL, &data_len) == 0 &&
-				data_len <= MAX_VALUE_DATA_LENGTH) {
-
-				if (data)
-					free(data);
-				data = NULL;
-
-				if ((data = malloc(data_len + 1)) == NULL ||
-					RegQueryValueExW(sub, value_name_to_remove, 0, NULL, data, &data_len) != 0)
-					goto done;
-				data[data_len] = '\0';
-				if (strncmp(data, value_data_to_remove, data_len) == 0) {
-					if (RegDeleteTreeW(root, sub_name) != 0)
-						goto done;
-					--index;
-				}
-			}
-		}
-		else {
-			if (retCode == ERROR_NO_MORE_ITEMS)
-				success = 1;
-			break;
-		}
-	}
-done:
-	if (data)
-		free(data);
-	if (root)
-		RegCloseKey(root);
-	if (sub)
-		RegCloseKey(sub);
-	return success ? 0 : -1;
-}
-
-/*
- * in user_root sub tree under key_name key
- * check whether sub_key_name sub key exists
- */
-static int
-is_reg_sub_key_exists(HKEY user_root, wchar_t const* key_name, char const* sub_key_name) {
-	int rv = 0;
-	HKEY root = 0, sub = 0;
-
-	if (RegOpenKeyExW(user_root, key_name, 0, STANDARD_RIGHTS_READ | KEY_WOW64_64KEY, &root) != 0 ||
-		RegOpenKeyExA(root, sub_key_name, 0, STANDARD_RIGHTS_READ | KEY_WOW64_64KEY, &sub) != 0 || !sub) {
-		rv = 0;
-		goto done;
-	}
-
-	rv = 1;
-done:
-	if (root)
-		RegCloseKey(root);
-	return rv;
-}
-
 #define REG_KEY_SDDL L"D:P(A;; GA;;; SY)(A;; GA;;; BA)"
 
 int
@@ -227,43 +190,44 @@ process_unsupported_request(struct sshbuf* request, struct sshbuf* response, str
 int
 process_add_identity(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
 {
+	Identity* id;
 	struct sshkey* key = NULL;
-	int r = 0, blob_len, eblob_len, request_invalid = 0, success = 0;
-	size_t comment_len, pubkey_blob_len;
-	u_char *pubkey_blob = NULL;
-	char *thumbprint = NULL, *comment;
-	const char *blob;
-	char* eblob = NULL;
-	HKEY reg = 0, sub = 0, user_root = 0;
-	SECURITY_ATTRIBUTES sa;
+	int r = 0, request_invalid = 0, success = 0;
+	char *fp = NULL, *comment;
 
 	/* parse input request */
-	memset(&sa, 0, sizeof(SECURITY_ATTRIBUTES));
-	blob = sshbuf_ptr(request);
-	if (sshkey_private_deserialize(request, &key) != 0 ||
-	   (blob_len = (sshbuf_ptr(request) - blob) & 0xffffffff) == 0 ||
-	    sshbuf_peek_string_direct(request, &comment, &comment_len) != 0) {
-		debug("key add request is invalid");
+	if ((r = sshkey_private_deserialize(request, &key)) != 0 ||
+		key == NULL ||
+		(r = sshbuf_get_cstring(request, &comment, NULL)) != 0) {
+		error("key add request is invalid");
 		request_invalid = 1;
 		goto done;
 	}
 
-	memset(&sa, 0, sizeof(SECURITY_ATTRIBUTES));
-	sa.nLength = sizeof(sa);
-	if ((!ConvertStringSecurityDescriptorToSecurityDescriptorW(REG_KEY_SDDL, SDDL_REVISION_1, &sa.lpSecurityDescriptor, &sa.nLength)) ||
-	    sshkey_to_blob(key, &pubkey_blob, &pubkey_blob_len) != 0 ||
-	    convert_blob(con, blob, blob_len, &eblob, &eblob_len, 1) != 0 ||
-	    ((thumbprint = sshkey_fingerprint(key, SSH_FP_HASH_DEFAULT, SSH_FP_DEFAULT)) == NULL) ||
-	    get_user_root(con, &user_root) != 0 ||
-	    RegCreateKeyExW(user_root, SSH_KEYS_ROOT, 0, 0, 0, KEY_WRITE | KEY_WOW64_64KEY, &sa, &reg, NULL) != 0 ||
-	    RegCreateKeyExA(reg, thumbprint, 0, 0, 0, KEY_WRITE | KEY_WOW64_64KEY, &sa, &sub, NULL) != 0 ||
-	    RegSetValueExW(sub, NULL, 0, REG_BINARY, eblob, eblob_len) != 0 ||
-	    RegSetValueExW(sub, L"pub", 0, REG_BINARY, pubkey_blob, (DWORD)pubkey_blob_len) != 0 ||
-	    RegSetValueExW(sub, L"type", 0, REG_DWORD, (BYTE*)&key->type, 4) != 0 ||
-	    RegSetValueExW(sub, L"comment", 0, REG_BINARY, comment, (DWORD)comment_len) != 0 ) {
-		error("failed to add key to store");
+	if ((r = sshkey_shield_private(key)) != 0) {
+		error("shield private");
 		goto done;
 	}
+
+	if ((id = lookup_identity(key)) == NULL) {
+		id = xcalloc(1, sizeof(Identity));
+		TAILQ_INSERT_TAIL(&idtab->idlist, id, next);
+		/* Increment the number of identities. */
+		idtab->nentries++;
+		/* success */
+		id->key = key;
+		id->comment = comment;
+		id->provider = NULL;
+	}
+
+	if ((fp = sshkey_fingerprint(key, SSH_FP_HASH_DEFAULT,
+		SSH_FP_DEFAULT)) == NULL)
+		fatal_f("sshkey_fingerprint failed");
+
+	free(fp);
+
+	key = NULL;
+	comment = NULL;
 
 	debug("added key to store");
 	success = 1;
@@ -273,27 +237,10 @@ done:
 		r = -1;
 	else if (sshbuf_put_u8(response, success ? SSH_AGENT_SUCCESS : SSH_AGENT_FAILURE) != 0)
 		r = -1;
-
-	/* delete created reg key if not succeeded*/
-	if ((success == 0) && reg && thumbprint)
-		RegDeleteKeyExA(reg, thumbprint, KEY_WOW64_64KEY, 0);
-
-	if (eblob)
-		free(eblob);
-	if (sa.lpSecurityDescriptor)
-		LocalFree(sa.lpSecurityDescriptor);
+	if (comment)
+		free(comment);
 	if (key)
 		sshkey_free(key);
-	if (thumbprint)
-		free(thumbprint);
-	if (user_root)
-		RegCloseKey(user_root);
-	if (reg)
-		RegCloseKey(reg);
-	if (sub)
-		RegCloseKey(sub);
-	if (pubkey_blob)
-		free(pubkey_blob);
 	return r;
 }
 
@@ -510,11 +457,11 @@ done:
 int
 process_remove_key(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
 {
-	HKEY user_root = 0, root = 0;
-	char *blob, *thumbprint = NULL;
+	char *blob = NULL;
 	size_t blen;
 	int r = 0, success = 0, request_invalid = 0;
 	struct sshkey *key = NULL;
+	Identity* id;
 
 	if (sshbuf_get_string_direct(request, &blob, &blen) != 0 ||
 	    sshkey_from_blob(blob, blen, &key) != 0) { 
@@ -522,12 +469,17 @@ process_remove_key(struct sshbuf* request, struct sshbuf* response, struct agent
 		goto done;
 	}
 
-	if ((thumbprint = sshkey_fingerprint(key, SSH_FP_HASH_DEFAULT, SSH_FP_DEFAULT)) == NULL ||
-	    get_user_root(con, &user_root) != 0 ||
-	    RegOpenKeyExW(user_root, SSH_KEYS_ROOT, 0,
-		DELETE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | KEY_WOW64_64KEY, &root) != 0 ||
-	    RegDeleteTreeA(root, thumbprint) != 0)
+	if ((id = lookup_identity(key)) == NULL) {
+		debug("key not found");
 		goto done;
+	}
+
+	/* We have this key, free it. */
+	if (idtab->nentries < 1)
+		fatal("internal error: nentries %d", idtab->nentries);
+	TAILQ_REMOVE(&idtab->idlist, id, next);
+	free_identity(id);
+	idtab->nentries--;
 	success = 1;
 done:
 	r = 0;
@@ -535,40 +487,26 @@ done:
 		r = -1;
 	else if (sshbuf_put_u8(response, success ? SSH_AGENT_SUCCESS : SSH_AGENT_FAILURE) != 0)
 		r = -1;
-
 	if (key)
 		sshkey_free(key);
-	if (user_root)
-		RegCloseKey(user_root);
-	if (root)
-		RegCloseKey(root);
-	if (thumbprint)
-		free(thumbprint);
 	return r;
 }
+
 int 
 process_remove_all(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
 {
-	HKEY user_root = 0, root = 0;
 	int r = 0;
+	Identity* id;
 
-	if (get_user_root(con, &user_root) != 0 ||
-	    RegOpenKeyExW(user_root, SSH_AGENT_ROOT, 0,
-		   DELETE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | KEY_WOW64_64KEY, &root) != 0) {
-		goto done;
+	/* Loop over all identities and clear the keys. */
+	for (id = TAILQ_FIRST(&idtab->idlist); id;
+		id = TAILQ_FIRST(&idtab->idlist)) {
+		TAILQ_REMOVE(&idtab->idlist, id, next);
+		free_identity(id);
 	}
 
-	RegDeleteTreeW(root, SSH_KEYS_KEY);
-	RegDeleteTreeW(root, SSH_PKCS11_PROVIDERS_KEY);
-done:
-	r = 0;
 	if (sshbuf_put_u8(response, SSH_AGENT_SUCCESS) != 0)
 		r = -1;
-
-	if (user_root)
-		RegCloseKey(user_root);
-	if (root)
-		RegCloseKey(root);
 	return r;
 }
 
@@ -577,18 +515,12 @@ int process_add_smartcard_key(struct sshbuf* request, struct sshbuf* response, s
 {
 	char *provider = NULL, *pin = NULL, canonical_provider[PATH_MAX];
 	int i, count = 0, r = 0, request_invalid = 0, success = 0;
+	size_t pin_len;
 	struct sshkey **keys = NULL;
 	struct sshkey* key = NULL;
-	size_t pubkey_blob_len, provider_len, pin_len, epin_len;
-	u_char *pubkey_blob = NULL;
-	char *thumbprint = NULL;
-	char *epin = NULL;
-	HKEY reg = 0, sub = 0, user_root = 0;
-	SECURITY_ATTRIBUTES sa = { 0, NULL, 0 };
+	Identity* id;
 
-	pkcs11_init(0);
-
-	if ((r = sshbuf_get_cstring(request, &provider, &provider_len)) != 0 ||
+	if ((r = sshbuf_get_cstring(request, &provider, NULL)) != 0 ||
 		(r = sshbuf_get_cstring(request, &pin, &pin_len)) != 0 ||
 		pin_len > 256) {
 		error("add smartcard request is invalid");
@@ -613,101 +545,37 @@ int process_add_smartcard_key(struct sshbuf* request, struct sshbuf* response, s
 		goto done;
 	}
 
-	// If HKCU registry already has the provider then remove the provider and associated keys.
-	// This allows customers to add new keys.
-	if (get_user_root(con, &user_root) != 0 ||
-		is_reg_sub_key_exists(user_root, SSH_PKCS11_PROVIDERS_ROOT, canonical_provider)) {
-		remove_matching_subkeys_from_registry(user_root, SSH_KEYS_ROOT, L"comment", canonical_provider);
-		remove_matching_subkeys_from_registry(user_root, SSH_PKCS11_PROVIDERS_ROOT, L"provider", canonical_provider);
-	}
-
 	for (i = 0; i < count; i++) {
 		key = keys[i];
-		if (sa.lpSecurityDescriptor)
-			LocalFree(sa.lpSecurityDescriptor);
-		if (reg) {
-			RegCloseKey(reg);
-			reg = NULL;
+		if (lookup_identity(key) == NULL) {
+			id = xcalloc(1, sizeof(Identity));
+			id->key = key;
+			keys[i] = NULL; /* transferred */
+			id->provider = xstrdup(canonical_provider);
+			id->comment = xstrdup(canonical_provider);
+			TAILQ_INSERT_TAIL(&idtab->idlist, id, next);
+			idtab->nentries++;
+			success = 1;
+			debug("added smartcard keys to store");
 		}
-		if (sub) {
-			RegCloseKey(sub);
-			sub = NULL;
-		}
-		memset(&sa, 0, sizeof(SECURITY_ATTRIBUTES));
-		sa.nLength = sizeof(sa);
-		if ((!ConvertStringSecurityDescriptorToSecurityDescriptorW(REG_KEY_SDDL, SDDL_REVISION_1, &sa.lpSecurityDescriptor, &sa.nLength)) ||
-			sshkey_to_blob(key, &pubkey_blob, &pubkey_blob_len) != 0 ||
-			((thumbprint = sshkey_fingerprint(key, SSH_FP_HASH_DEFAULT, SSH_FP_DEFAULT)) == NULL) ||
-			RegCreateKeyExW(user_root, SSH_KEYS_ROOT, 0, 0, 0, KEY_WRITE | KEY_WOW64_64KEY, &sa, &reg, NULL) != 0 ||
-			RegCreateKeyExA(reg, thumbprint, 0, 0, 0, KEY_WRITE | KEY_WOW64_64KEY, &sa, &sub, NULL) != 0 ||
-			RegSetValueExW(sub, NULL, 0, REG_BINARY, pubkey_blob, (DWORD)pubkey_blob_len) != 0 ||
-			RegSetValueExW(sub, L"pub", 0, REG_BINARY, pubkey_blob, (DWORD)pubkey_blob_len) != 0 ||
-			RegSetValueExW(sub, L"type", 0, REG_DWORD, (BYTE*)&key->type, 4) != 0 ||
-			RegSetValueExW(sub, L"comment", 0, REG_BINARY, canonical_provider, (DWORD)strlen(canonical_provider)) != 0) {
-			error_f("failed to add key to store");
-			goto done;
-		}
+		/* XXX update constraints for existing keys */
+		sshkey_free(keys[i]);
 	}
 
-	debug("added smartcard keys to store");
-
-	memset(&sa, 0, sizeof(SECURITY_ATTRIBUTES));
-	sa.nLength = sizeof(sa);
-	if ((!ConvertStringSecurityDescriptorToSecurityDescriptorW(REG_KEY_SDDL, SDDL_REVISION_1, &sa.lpSecurityDescriptor, &sa.nLength)) ||
-		convert_blob(con, pin, (DWORD)pin_len, &epin, (DWORD*)&epin_len, 1) != 0 ||
-		RegCreateKeyExW(user_root, SSH_PKCS11_PROVIDERS_ROOT, 0, 0, 0, KEY_WRITE | KEY_WOW64_64KEY, &sa, &reg, NULL) != 0 ||
-		RegCreateKeyExA(reg, canonical_provider, 0, 0, 0, KEY_WRITE | KEY_WOW64_64KEY, &sa, &sub, NULL) != 0 ||
-		RegSetValueExW(sub, L"provider", 0, REG_BINARY, canonical_provider, (DWORD)strlen(canonical_provider)) != 0 ||
-		RegSetValueExW(sub, L"pin", 0, REG_BINARY, epin, (DWORD)epin_len) != 0) {
-		error("failed to add pkcs11 provider to store");
-		goto done;
-	}
-
-	debug("added pkcs11 provider to store");
-	success = 1;
 done:
 	r = 0;
 	if (request_invalid)
 		r = -1;
 	else if (sshbuf_put_u8(response, success ? SSH_AGENT_SUCCESS : SSH_AGENT_FAILURE) != 0)
 		r = -1;
-
-	/* delete created reg keys if not succeeded*/
-	if ((success == 0) && reg) {
-		if (thumbprint)
-			RegDeleteKeyExA(reg, thumbprint, KEY_WOW64_64KEY, 0);
-		if (canonical_provider)
-			RegDeleteKeyExA(reg, canonical_provider, KEY_WOW64_64KEY, 0);
-	}
-
-	pkcs11_terminate();
-
-	if (sa.lpSecurityDescriptor)
-		LocalFree(sa.lpSecurityDescriptor);
-	for (i = 0; i < count; i++)
-		sshkey_free(keys[i]);
 	if (keys)
 		free(keys);
-	if (thumbprint)
-		free(thumbprint);
-	if (pubkey_blob)
-		free(pubkey_blob);
 	if (provider)
 		free(provider);
 	if (pin) {
 		SecureZeroMemory(pin, (DWORD)pin_len);
 		free(pin);
 	}
-	if (epin) {
-		SecureZeroMemory(epin, (DWORD)epin_len);
-		free(epin);
-	}
-	if (user_root)
-		RegCloseKey(user_root);
-	if (reg)
-		RegCloseKey(reg);
-	if (sub)
-		RegCloseKey(sub);
 	return r;
 }
 
@@ -716,6 +584,7 @@ int process_remove_smartcard_key(struct sshbuf* request, struct sshbuf* response
 	char *provider = NULL, *pin = NULL, canonical_provider[PATH_MAX];
 	int r = 0, request_invalid = 0, success = 0, index = 0;
 	HKEY user_root = 0;
+	Identity* id, * nxt;
 
 	if ((r = sshbuf_get_cstring(request, &provider, NULL)) != 0 ||
 		(r = sshbuf_get_cstring(request, &pin, NULL)) != 0) {
@@ -735,16 +604,23 @@ int process_remove_smartcard_key(struct sshbuf* request, struct sshbuf* response
 	if (canonical_provider[0] == '/')
 		memmove(canonical_provider, canonical_provider + 1, strlen(canonical_provider));
 
-	if (get_user_root(con, &user_root) != 0 ||
-		!is_reg_sub_key_exists(user_root, SSH_PKCS11_PROVIDERS_ROOT, canonical_provider))
-		goto done;
-
-	if (remove_matching_subkeys_from_registry(user_root, SSH_KEYS_ROOT, L"comment", canonical_provider) != 0 ||
-		remove_matching_subkeys_from_registry(user_root, SSH_PKCS11_PROVIDERS_ROOT, L"provider", canonical_provider) != 0) {
-		goto done;
+	debug_f("remove %.100s", canonical_provider);
+	for (id = TAILQ_FIRST(&idtab->idlist); id; id = nxt) {
+		nxt = TAILQ_NEXT(id, next);
+		/* Skip file--based keys */
+		if (id->provider == NULL)
+			continue;
+		if (!strcmp(canonical_provider, id->provider)) {
+			TAILQ_REMOVE(&idtab->idlist, id, next);
+			free_identity(id);
+			idtab->nentries--;
+		}
 	}
+	if (pkcs11_del_provider(canonical_provider) == 0)
+		success = 1;
+	else
+		error("pkcs11_del_provider failed");
 
-	success = 1;
 done:
 	r = 0;
 	if (request_invalid)
@@ -755,8 +631,6 @@ done:
 		free(provider);
 	if (pin)
 		free(pin);
-	if (user_root)
-		RegCloseKey(user_root);
 	return r;
 }
 #endif /* ENABLE_PKCS11 */
@@ -764,54 +638,22 @@ done:
 int
 process_request_identities(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
 {
-	int count = 0, index = 0, success = 0, r = 0;
-	HKEY root = NULL, sub = NULL, user_root = 0;
-	char* count_ptr = NULL;
-	wchar_t sub_name[MAX_KEY_LENGTH];
-	DWORD sub_name_len = MAX_KEY_LENGTH;
-	char *pkblob = NULL, *comment = NULL;
-	DWORD regdatalen = 0, commentlen = 0, key_count = 0;
+	int success = 0, r = 0;
+	DWORD key_count = 0;
 	struct sshbuf* identities;
+	Identity* id;
 
 	if ((identities = sshbuf_new()) == NULL)
 		goto done;
 
-	if ( get_user_root(con, &user_root) != 0 ||
-	    RegOpenKeyExW(user_root, SSH_KEYS_ROOT, 0, STANDARD_RIGHTS_READ | KEY_ENUMERATE_SUB_KEYS | KEY_WOW64_64KEY, &root) != 0) {
-		success = 1;
-		goto done;
-	}
-
-	while (1) {
-		sub_name_len = MAX_KEY_LENGTH;
-		if (sub) {
-			RegCloseKey(sub);
-			sub = NULL;
+	TAILQ_FOREACH(id, &idtab->idlist, next) {
+		if ((r = sshkey_puts_opts(id->key, identities,
+			SSHKEY_SERIALIZE_INFO)) != 0 ||
+			(r = sshbuf_put_cstring(identities, id->comment)) != 0) {
+			error("compose key/comment");
+			continue;
 		}
-		if (RegEnumKeyExW(root, index++, sub_name, &sub_name_len, NULL, NULL, NULL, NULL) == 0) {
-			if (RegOpenKeyExW(root, sub_name, 0, KEY_QUERY_VALUE | KEY_WOW64_64KEY, &sub) == 0 &&
-				RegQueryValueExW(sub, L"pub", 0, NULL, NULL, &regdatalen) == 0 &&
-				RegQueryValueExW(sub, L"comment", 0, NULL, NULL, &commentlen) == 0) {
-				if (pkblob)
-					free(pkblob);
-				if (comment)
-					free(comment);
-				pkblob = NULL;
-				comment = NULL;
-
-				if ((pkblob = malloc(regdatalen)) == NULL ||
-					(comment = malloc(commentlen)) == NULL ||
-					RegQueryValueExW(sub, L"pub", 0, NULL, pkblob, &regdatalen) != 0 ||
-					RegQueryValueExW(sub, L"comment", 0, NULL, comment, &commentlen) != 0 ||
-					sshbuf_put_string(identities, pkblob, regdatalen) != 0 ||
-					sshbuf_put_string(identities, comment, commentlen) != 0)
-					goto done;
-
-				key_count++;
-			}
-		} else
-			break;
-
+		key_count++;
 	}
 
 	success = 1;
@@ -824,19 +666,8 @@ done:
 			goto done;
 	} else
 		r = -1;
-
-	if (pkblob)
-		free(pkblob);
-	if (comment)
-		free(comment);
 	if (identities)
 		sshbuf_free(identities);
-	if (user_root)
-		RegCloseKey(user_root);
-	if (root)
-		RegCloseKey(root);
-	if (sub)
-		RegCloseKey(sub);
 	return r;
 }
 
