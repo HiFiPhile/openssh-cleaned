@@ -41,10 +41,6 @@
 
 #pragma warning(push, 3)
 
-#define MAX_KEY_LENGTH 255
-#define MAX_VALUE_NAME_LENGTH 16383
-#define MAX_VALUE_DATA_LENGTH 2048
-
 typedef struct identity {
 	TAILQ_ENTRY(identity) next;
 	struct sshkey* key;
