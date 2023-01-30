@@ -42,9 +42,6 @@
 #include <openssl/dh.h>
 #endif
 
-#ifdef WINDOWS
-#include "sshTelemetry.h"
-#endif
 
 #include "ssh.h"
 #include "ssh2.h"
@@ -1015,14 +1012,6 @@ kex_choose_conf(struct ssh *ssh)
 		    newkeys->enc.name,
 		    authlen == 0 ? newkeys->mac.name : "<implicit>",
 		    newkeys->comp.name);
-#ifdef WINDOWS
-		send_encryption_telemetry(ctos ? "ctos" : "stoc",
-			newkeys->enc.name, kex->name ? kex->name : "(no match)", 
-			authlen == 0 ? newkeys->mac.name : "<implicit>", 
-			newkeys->comp.name, 
-			kex->hostkey_alg ? kex->hostkey_alg : "(no match)", 
-			my, peer);
-#endif
 	}
 	need = dh_need = 0;
 	for (mode = 0; mode < MODE_MAX; mode++) {
@@ -1377,10 +1366,6 @@ kex_exchange_identification(struct ssh *ssh, int timeout_ms,
 	    &remote_major, &remote_minor, remote_version) != 3) {
 		error("Bad remote protocol version identification: '%.100s'",
 		    peer_version_string);
-#ifdef WINDOWS
-		send_ssh_version_telemetry(our_version_string, peer_version_string,
-			"Bad remote protocol version identification");
-#endif
 
  invalid:
 		send_error(ssh, "Invalid SSH identification string.");
@@ -1407,10 +1392,6 @@ kex_exchange_identification(struct ssh *ssh, int timeout_ms,
 		error("Protocol major versions differ: %d vs. %d",
 		    PROTOCOL_MAJOR_2, remote_major);
 		send_error(ssh, "Protocol major versions differ.");
-#ifdef WINDOWS
-		send_ssh_version_telemetry(our_version_string, 
-			peer_version_string, "Protocol major versions differ");
-#endif
 		r = SSH_ERR_NO_PROTOCOL_VERSION;
 		goto out;
 	}
@@ -1434,10 +1415,6 @@ kex_exchange_identification(struct ssh *ssh, int timeout_ms,
 		    "scheme; disabling use of RSA keys", remote_version);
 	}
 
-#ifdef WINDOWS
-	send_ssh_version_telemetry(our_version_string, 
-		peer_version_string, "none");
-#endif
 	/* success */
 	r = 0;
  out:

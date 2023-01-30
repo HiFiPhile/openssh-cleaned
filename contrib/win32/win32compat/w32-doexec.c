@@ -38,7 +38,6 @@
 #include "servconf.h"
 #include "pal_doexec.h"
 #include "misc_internal.h"
-#include "sshTelemetry.h"
 
 #ifndef SUBSYSTEM_NONE
 #define SUBSYSTEM_NONE				0
@@ -388,7 +387,6 @@ int do_exec_windows(struct ssh *ssh, Session *s, const char *command, int pty) {
 	else
 		shell_command_option_local = "-c";
 	debug3("shell_option: %s", shell_command_option_local);
-	send_shell_telemetry(pty, shell_type);
 
 	if (pty) {
 		fcntl(s->ptyfd, F_SETFD, FD_CLOEXEC);

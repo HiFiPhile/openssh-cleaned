@@ -58,9 +58,6 @@
 #endif
 #include "monitor_wrap.h"
 #include "digest.h"
-#ifdef WINDOWS
-#include "sshTelemetry.h"
-#endif
 
 /* import */
 extern ServerOptions options;
@@ -448,9 +445,6 @@ userauth_finish(struct ssh *ssh, int authenticated, const char *packet_method,
 		methods = authmethods_get(authctxt);
 		debug3_f("failure partial=%d next methods=\"%s\"",
 		    partial, methods);
-#ifdef WINDOWS
-		send_auth_method_telemetry(methods);
-#endif
 		if ((r = sshpkt_start(ssh, SSH2_MSG_USERAUTH_FAILURE)) != 0 ||
 		    (r = sshpkt_put_cstring(ssh, methods)) != 0 ||
 		    (r = sshpkt_put_u8(ssh, partial)) != 0 ||
