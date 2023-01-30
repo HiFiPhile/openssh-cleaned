@@ -106,6 +106,7 @@ fd_table_initialize()
 			memset(pio, 0, sizeof(struct w32_io));
 			pio->type = NONSOCK_SYNC_FD;
 			pio->handle = wh;
+			InitializeCriticalSection(&pio->mutex);
 			fd_table_set(pio, fd_num);
 		}
 	}
@@ -543,22 +544,33 @@ w32_open(const char *pathname, int flags, ... /* arg */)
 int
 w32_read(int fd, void *dst, size_t max)
 {
+	int ret;
 	CHECK_FD(fd);
-	if (fd_table.w32_ios[fd]->type == SOCK_FD)
-		return socketio_recv(fd_table.w32_ios[fd], dst, max, 0);
-
-	return fileio_read(fd_table.w32_ios[fd], dst, max);
+	if(fd <= STDERR_FILENO)
+		EnterCriticalSection(&fd_table.w32_ios[fd]->mutex);
+	if(fd_table.w32_ios[fd]->type == SOCK_FD)
+		ret = socketio_recv(fd_table.w32_ios[fd], dst, max, 0);
+	else
+		ret = fileio_read(fd_table.w32_ios[fd], dst, max);
+	if(fd <= STDERR_FILENO)
+		LeaveCriticalSection(&fd_table.w32_ios[fd]->mutex);
+	return ret;
 }
 
 int
 w32_write(int fd, const void *buf, size_t max)
 {
+	int ret;
 	CHECK_FD(fd);
-
-	if (fd_table.w32_ios[fd]->type == SOCK_FD)
-		return socketio_send(fd_table.w32_ios[fd], buf, max, 0);
-
-	return fileio_write_wrapper(fd_table.w32_ios[fd], buf, max);
+	if(fd <= STDERR_FILENO)
+		EnterCriticalSection(&fd_table.w32_ios[fd]->mutex);
+	if(fd_table.w32_ios[fd]->type == SOCK_FD)
+		ret = socketio_send(fd_table.w32_ios[fd], buf, max, 0);
+	else
+		ret = fileio_write_wrapper(fd_table.w32_ios[fd], buf, max);
+	if(fd <= STDERR_FILENO)
+		LeaveCriticalSection(&fd_table.w32_ios[fd]->mutex);
+	return ret;
 }
 
 int

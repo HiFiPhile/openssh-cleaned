@@ -36,24 +36,14 @@
 #include <pwd.h>
 
 #define BUFSIZE 5 * 1024
-
-char* sshagent_con_username;
-HANDLE sshagent_client_primary_token;
-
-static HANDLE ioc_port = NULL;
 static BOOL debug_mode = FALSE;
 
 #define AGENT_PIPE_ID L"\\\\.\\pipe\\openssh-ssh-agent"
 
-static HANDLE event_stop_agent;
-static OVERLAPPED ol;
-static 	HANDLE pipe;
-static	SECURITY_ATTRIBUTES sa;
-
-static size_t nsession_ids;
-static struct hostkey_sid *session_ids;
-static struct dest_constraint *dest_constraints;
-static size_t ndest_constraints;
+static HANDLE              event_stop_agent;
+static OVERLAPPED          ol;
+static HANDLE              pipe;
+static SECURITY_ATTRIBUTES sa;
 
 extern void
 idtab_init(void);
@@ -65,13 +55,11 @@ agent_cleanup()
 		CloseHandle(ol.hEvent);
 	if (pipe != INVALID_HANDLE_VALUE)
 		CloseHandle(pipe);
-	if (ioc_port)
-		CloseHandle(ioc_port);
 	return;
 }
 
 static DWORD WINAPI 
-iocp_work(LPVOID lpParam) 
+iocp_work(HANDLE ioc_port) 
 {
 	DWORD bytes;
 	struct agent_connection* con = NULL;
@@ -116,15 +104,15 @@ agent_listen_loop()
 
 	while (1) {
 		pipe = CreateNamedPipeW(
-			AGENT_PIPE_ID,		  // pipe name 
-			PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,       // read/write access 
-			PIPE_TYPE_BYTE |       // message type pipe 
-			PIPE_READMODE_BYTE |   // message-read mode 
-			PIPE_WAIT,                // blocking mode 
-			PIPE_UNLIMITED_INSTANCES, // max. instances  
-			BUFSIZE,                  // output buffer size 
-			BUFSIZE,                  // input buffer size 
-			0,                        // client time-out 
+			AGENT_PIPE_ID,                             // pipe name
+			PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, // read/write access
+			PIPE_TYPE_BYTE |                           // message type pipe
+				PIPE_READMODE_BYTE |                   // message-read mode
+				PIPE_WAIT,                             // blocking mode
+			PIPE_UNLIMITED_INSTANCES,                  // max. instances
+			BUFSIZE,                                   // output buffer size
+			BUFSIZE,                                   // input buffer size
+			0,                                         // client time-out
 			&sa);
 
 		if (pipe == INVALID_HANDLE_VALUE) {
@@ -134,7 +122,7 @@ agent_listen_loop()
 			verbose("ConnectNamedPipe returned TRUE unexpectedly ");
 			SetEvent(event_stop_agent);
 		}
-				
+
 		if (GetLastError() == ERROR_PIPE_CONNECTED) {
 			debug("Client has already connected");
 			SetEvent(ol.hEvent);
@@ -156,18 +144,17 @@ agent_listen_loop()
 			pipe = INVALID_HANDLE_VALUE;
 			GetNamedPipeClientProcessId(con, &client_pid);
 			verbose("client pid %d connected", client_pid);
-			//if (debug_mode) {
-			agent_process_connection(con);
+			// if (debug_mode) {
+			// agent_process_connection(con);
 			/* termio doesn't work with multithread */
 			//} else {
 			//	/* spawn a child to take care of this*/
-			//	CreateThread(NULL, 0, agent_process_connection, con, 0, NULL);
-			//	debug("spawned worker for agent client pid %d ", client_pid);
+			CreateThread(NULL, 0, agent_process_connection, con, 0, NULL);
+			debug("spawned worker for agent client pid %d ", client_pid);
 			//}
 		} else {
 			fatal("wait on events ended with %d ERROR:%d", r, GetLastError());
 		}
-
 	}
 }
 
@@ -177,32 +164,19 @@ agent_cleanup_connection(struct agent_connection* con)
 	debug("connection %p clean up", con);
 	CloseHandle(con->pipe_handle);
 	if (con->client_impersonation_token)
-			CloseHandle(con->client_impersonation_token);
+		CloseHandle(con->client_impersonation_token);
 	if (con->client_process_handle)
 		CloseHandle(con->client_process_handle);
-
+	if (con->iocp)
+		CloseHandle(con->iocp);
 	for (size_t i = 0; i < con->nsession_ids; i++) {
 		sshkey_free(con->session_ids[i].key);
 		sshbuf_free(con->session_ids[i].sid);
 	}
 	free(con->session_ids);
 	con->nsession_ids = 0;
-	
+
 	free(con);
-	CloseHandle(ioc_port);
-	ioc_port = NULL;
-
-	if(sshagent_con_username) {
-		free(sshagent_con_username);
-		sshagent_con_username = NULL;
-	}
-
-#ifdef ENABLE_PKCS11
-	if (sshagent_client_primary_token)
-		CloseHandle(sshagent_client_primary_token);
-
-	pkcs11_terminate();
-#endif
 }
 
 void 
@@ -218,7 +192,7 @@ agent_start(BOOL dbg_mode)
 	HKEY agent_root = NULL;
 	DWORD process_id = GetCurrentProcessId();
 	wchar_t* sddl_str;
-	
+
 	verbose("%s pid:%d, dbg:%d", __FUNCTION__, process_id, dbg_mode);
 	debug_mode = dbg_mode;
 
@@ -268,7 +242,7 @@ con_type_to_string(struct agent_connection* con)
 }
 
 static int
-get_con_client_info(struct agent_connection* con)
+get_con_client_info(struct agent_connection* con, PHANDLE sshagent_client_primary_token)
 {
 	int r = -1;
 	char sid[SECURITY_MAX_SID_SIZE];
@@ -279,6 +253,7 @@ get_con_client_info(struct agent_connection* con)
 	HANDLE client_primary_token = NULL, client_impersonation_token = NULL, client_process_handle = NULL;
 	TOKEN_USER* info = NULL;
 	BOOL isMember = FALSE;
+	char* sshagent_con_username = NULL;
 
 	if (GetNamedPipeClientProcessId(con->pipe_handle, &client_pid) == FALSE ||
 		(client_process_handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, FALSE, client_pid)) == NULL ||
@@ -294,7 +269,7 @@ get_con_client_info(struct agent_connection* con)
 
 	if (GetTokenInformation(client_primary_token, TokenUser, info, info_len, &info_len) == FALSE)
 		goto done;
-	
+
 	/* check if its localsystem */
 	if (IsWellKnownSid(info->User.Sid, WinLocalSystemSid)) {
 		con->client_type = SYSTEM;
@@ -311,12 +286,12 @@ get_con_client_info(struct agent_connection* con)
 	}
 
 	// Get client primary token
-	if (DuplicateTokenEx(client_primary_token, TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE, NULL, SecurityImpersonation, TokenPrimary, &sshagent_client_primary_token) == FALSE) {
+	if (DuplicateTokenEx(client_primary_token, TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE, NULL, SecurityImpersonation, TokenPrimary, sshagent_client_primary_token) == FALSE) {
 		error_f("Failed to duplicate the primary token. error:%d", GetLastError());
 	}
 
 	// Get username
-	sshagent_con_username= get_username(info->User.Sid);
+	sshagent_con_username = get_username(info->User.Sid);
 	if (sshagent_con_username)
 		debug_f("sshagent_con_username: %s", sshagent_con_username);
 	else
@@ -349,12 +324,13 @@ done:
 		free(info);
 	if (client_primary_token)
 		CloseHandle(client_primary_token);
-
+	if (sshagent_con_username) {
+		free(sshagent_con_username);
+	}
 	if (r == 0) {
 		con->client_process_handle = client_process_handle;
 		con->client_impersonation_token = client_impersonation_token;
-	}
-	else {
+	} else {
 		if (client_process_handle)
 			CloseHandle(client_process_handle);
 		if (client_impersonation_token)
@@ -368,6 +344,9 @@ DWORD
 agent_process_connection(LPVOID pipe) 
 {
 	struct agent_connection* con;
+	HANDLE sshagent_client_primary_token;
+	HANDLE ioc_port = NULL;
+
 	verbose("%s pipe:%p", __FUNCTION__, pipe);
 
 	if ((ioc_port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, (ULONG_PTR)NULL, 0)) == NULL)
@@ -381,11 +360,19 @@ agent_process_connection(LPVOID pipe)
 	if (CreateIoCompletionPort(pipe, ioc_port, (ULONG_PTR)con, 0) != ioc_port)
 		fatal("failed to assign pipe to ioc_port");
 
+	con->iocp = ioc_port;
+
 	/* get client details */
-	if (get_con_client_info(con) == -1)
+	if (get_con_client_info(con, &sshagent_client_primary_token) == -1)
 		fatal("failed to retrieve client details");
 
 	agent_connection_on_io(con, 0, &con->ol);
-	iocp_work(NULL);
-}
+	iocp_work(ioc_port);
 
+#ifdef ENABLE_PKCS11
+	if (sshagent_client_primary_token)
+		CloseHandle(sshagent_client_primary_token);
+#endif
+
+	return 0;
+}

@@ -30,6 +30,7 @@ struct agent_connection {
 	HANDLE pipe_handle;
 	HANDLE client_impersonation_token;
 	HANDLE client_process_handle;
+	HANDLE iocp;
 	struct {
 		DWORD num_bytes;
 		DWORD transferred;
