@@ -105,7 +105,7 @@ agent_decode_alg(struct sshkey* key, u_int flags)
 }
 
 int
-process_unsupported_request(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con)
+process_unsupported_request(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con)
 {
 	int r = 0;
 	debug("ssh protocol 1 is not supported");
@@ -115,7 +115,7 @@ process_unsupported_request(struct sshbuf* request, struct sshbuf* response, str
 }
 
 int
-process_add_identity(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
+process_add_identity(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con) 
 {
 	Identity* id;
 	struct sshkey* key = NULL;
@@ -176,7 +176,7 @@ done:
 }
 
 int
-process_sign_request(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
+process_sign_request(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con) 
 {
 	u_char* blob, * data, * signature = NULL;
 	size_t blen, dlen, slen = 0;
@@ -250,7 +250,7 @@ done:
 }
 
 int
-process_remove_key(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
+process_remove_key(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con) 
 {
 	char *blob = NULL;
 	size_t blen;
@@ -288,7 +288,7 @@ done:
 }
 
 int 
-process_remove_all(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
+process_remove_all(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con) 
 {
 	int r = 0;
 	Identity* id;
@@ -306,7 +306,7 @@ process_remove_all(struct sshbuf* request, struct sshbuf* response, struct agent
 }
 
 #ifdef ENABLE_PKCS11
-int process_add_smartcard_key(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con)
+int process_add_smartcard_key(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con)
 {
 	char *provider = NULL, *pin = NULL, canonical_provider[PATH_MAX];
 	int i, count = 0, r = 0, request_invalid = 0, success = 0;
@@ -374,7 +374,7 @@ done:
 	return r;
 }
 
-int process_remove_smartcard_key(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con)
+int process_remove_smartcard_key(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con)
 {
 	char *provider = NULL, *pin = NULL, canonical_provider[PATH_MAX];
 	int r = 0, request_invalid = 0, success = 0, index = 0;
@@ -431,7 +431,7 @@ done:
 #endif /* ENABLE_PKCS11 */
 
 int
-process_request_identities(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
+process_request_identities(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con) 
 {
 	int success = 0, r = 0;
 	DWORD key_count = 0;
@@ -481,7 +481,7 @@ buf_equal(const struct sshbuf *a, const struct sshbuf *b)
 }
 
 static int
-process_ext_session_bind(struct sshbuf* request, struct agent_connection* con)
+process_ext_session_bind(struct sshbuf* request, LPPIPEINST con)
 {
 	int r, sid_match, key_match;
 	struct sshkey *key = NULL;
@@ -561,7 +561,7 @@ process_ext_session_bind(struct sshbuf* request, struct agent_connection* con)
 }
 
 int
-process_extension(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con)
+process_extension(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con)
 {
 	int r, success = 0;
 	char *name;
@@ -587,7 +587,7 @@ send:
 }
 
 #if 0
-int process_keyagent_request(struct sshbuf* request, struct sshbuf* response, struct agent_connection* con) 
+int process_keyagent_request(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con)
 {
 	u_char type;
 

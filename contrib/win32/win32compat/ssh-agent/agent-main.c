@@ -74,9 +74,8 @@ service_handler(DWORD dwControl)
 	switch (dwControl)
 	{
 	case SERVICE_CONTROL_STOP: {
-		ReportSvcStatus(SERVICE_STOP_PENDING, NO_ERROR, 500);
-		agent_shutdown();
 		ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
+		exit(0);
 		return;
 	}
 	case SERVICE_CONTROL_INTERROGATE:
@@ -86,15 +85,6 @@ service_handler(DWORD dwControl)
 	}
 
 	ReportSvcStatus(service_status.dwCurrentState, NO_ERROR, 0);
-}
-
-BOOL WINAPI 
-ctrl_c_handler(_In_ DWORD dwCtrlType) 
-{
-	/* for any Ctrl type, shutdown agent*/
-	debug4("Ctrl+C received");
-	agent_shutdown();
-	return TRUE;
 }
 
 /*set current working directory to module path*/
@@ -140,19 +130,10 @@ wmain(int argc, wchar_t **argv)
 
 				/* Set Ctrl+C handler if starting in debug mode */
 				if (wcsncmp(argv[1], L"-d", 2) == 0) {
-					SetConsoleCtrlHandler(ctrl_c_handler, TRUE);
 					agent_start(TRUE);
 					return 0;
 				}
 
-				/*agent process is likely a spawned child*/
-				char* h = 0;
-				h += _wtoi(*(argv + 1));
-				if (h != 0) {
-					log_init("ssh-agent", 3, 1, 0);
-					agent_process_connection(h);
-					return 0;
-				}
 			}
 			/* to support linux compat scenarios where ssh-agent.exe is typically launched per session*/
 			/* - just start ssh-agent service if needed */

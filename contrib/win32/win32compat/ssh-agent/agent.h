@@ -25,42 +25,24 @@ struct hostkey_sid {
 	int forwarded;
 };
 
-struct agent_connection {
-	OVERLAPPED ol;
-	HANDLE pipe_handle;
-	HANDLE client_impersonation_token;
-	HANDLE client_process_handle;
-	HANDLE iocp;
-	struct {
-		DWORD num_bytes;
-		DWORD transferred;
-		char buf[MAX_MESSAGE_SIZE];
-		DWORD buf_size;
-	} io_buf;
-	enum {
-		LISTENING = 0,
-		READING_HEADER,
-		READING,
-		WRITING,
-		DONE
-	} state;
-	enum { /* retain this order */
-		UNKNOWN = 0,
-		NONADMIN_USER, /* client is running as a nonadmin user */
-		ADMIN_USER, /* client is running as admin */
-		SYSTEM, /* client is running as System */
-		SERVICE, /* client is running as LS or NS */
-	} client_type;
-	
+typedef struct
+{
+	OVERLAPPED oOverlap;
+	HANDLE hPipeInst;
+	char chBuf[MAX_MESSAGE_SIZE];
+	DWORD chSize;
+
 	size_t nsession_ids;
-	struct hostkey_sid *session_ids;
-};
+	struct hostkey_sid* session_ids;
+} PIPEINST, * LPPIPEINST;
 
-void agent_connection_on_io(struct agent_connection*, DWORD, OVERLAPPED*);
-void agent_connection_on_error(struct agent_connection* , DWORD);
-void agent_connection_disconnect(struct agent_connection*);
+void agent_start(BOOL dbg_mode);
 
-void agent_start(BOOL);
-DWORD agent_process_connection(LPVOID);
-void agent_shutdown();
-void agent_cleanup_connection(struct agent_connection*);
+static VOID ConnectionLoop(VOID);
+VOID DisconnectAndClose(LPPIPEINST);
+BOOL CreateAndConnectInstance(LPOVERLAPPED);
+BOOL ConnectToNewClient(HANDLE, LPOVERLAPPED);
+VOID GetAnswerToRequest(LPPIPEINST);
+
+VOID WINAPI CompletedWriteRoutine(DWORD, DWORD, LPOVERLAPPED);
+VOID WINAPI CompletedReadRoutine(DWORD, DWORD, LPOVERLAPPED);

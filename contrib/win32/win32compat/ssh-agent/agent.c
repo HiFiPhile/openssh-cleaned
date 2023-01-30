@@ -28,8 +28,9 @@
  * (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF
  * THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
  */
-#include "config.h"
 #include "agent.h"
+#include "agent-request.h"
+#include "config.h"
 #include <sddl.h>
 #include <UserEnv.h>
 #include "..\misc_internal.h"
@@ -39,55 +40,21 @@
 
 #define AGENT_PIPE_ID L"\\\\.\\pipe\\openssh-ssh-agent"
 
-static HANDLE              event_stop_agent;
-static OVERLAPPED          ol;
-static HANDLE              pipe;
 static SECURITY_ATTRIBUTES sa;
 
-extern CRITICAL_SECTION    req_mutex;
+static HANDLE hPipe;
 
 extern void
 idtab_init(void);
 
 static void
-agent_cleanup() 
+ConnectionLoop()
 {
-	if (ol.hEvent != NULL)
-		CloseHandle(ol.hEvent);
-	if (pipe != INVALID_HANDLE_VALUE)
-		CloseHandle(pipe);
-	return;
-}
-
-static DWORD WINAPI 
-iocp_work(HANDLE ioc_port) 
-{
-	DWORD bytes;
-	struct agent_connection* con = NULL;
-	OVERLAPPED *p_ol;
-	while (1) {
-		con = NULL;
-		p_ol = NULL;
-		if (GetQueuedCompletionStatus(ioc_port, &bytes, &(ULONG_PTR)con, &p_ol, INFINITE) == FALSE) {
-			debug("iocp error: %d on %p", GetLastError(), con);
-			if (con)
-				agent_connection_on_error(con, GetLastError());
-			else
-				return 0;
-		}
-		else
-			agent_connection_on_io(con, bytes, p_ol);
-	}
-}
-
-static void 
-agent_listen_loop() 
-{
-	DWORD  r;
-	HANDLE wait_events[2];
-
-	wait_events[0] = event_stop_agent;
-	wait_events[1] = ol.hEvent;
+	HANDLE hConnectEvent;
+	OVERLAPPED oConnect;
+	LPPIPEINST lpPipeInst;
+	DWORD dwWait, cbRet;
+	BOOL fSuccess, fPendingIO;
 
 	wchar_t* sddl_str;
 	memset(&sa, 0, sizeof(SECURITY_ATTRIBUTES));
@@ -103,84 +70,357 @@ agent_listen_loop()
 
 	sa.bInheritHandle = FALSE;
 
-	while (1) {
-		pipe = CreateNamedPipeW(
-			AGENT_PIPE_ID,                             // pipe name
-			PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED, // read/write access
-			PIPE_TYPE_BYTE |                           // message type pipe
-				PIPE_READMODE_BYTE |                   // message-read mode
-				PIPE_WAIT,                             // blocking mode
-			PIPE_UNLIMITED_INSTANCES,                  // max. instances
-			BUFSIZE,                                   // output buffer size
-			BUFSIZE,                                   // input buffer size
-			0,                                         // client time-out
-			&sa);
+	// Create one event object for the connect operation. 
+	hConnectEvent = CreateEvent(
+		NULL,    // default security attribute
+		TRUE,    // manual reset event 
+		TRUE,    // initial state = signaled 
+		NULL);   // unnamed event object 
 
-		if (pipe == INVALID_HANDLE_VALUE) {
-			verbose("cannot create listener pipe ERROR:%d", GetLastError());
-			SetEvent(event_stop_agent);
-		} else if (ConnectNamedPipe(pipe, &ol) != FALSE) {
-			verbose("ConnectNamedPipe returned TRUE unexpectedly ");
-			SetEvent(event_stop_agent);
+	if (hConnectEvent == NULL)
+	{
+		fatal("CreateEvent failed with %d.\n", GetLastError());
+	}
+
+	oConnect.hEvent = hConnectEvent;
+
+	// Call a subroutine to create one instance, and wait for 
+	// the client to connect. 
+	fPendingIO = CreateAndConnectInstance(&oConnect);
+
+	while (1)
+	{
+		// Wait for a client to connect, or for a read or write 
+		// operation to be completed, which causes a completion 
+		// routine to be queued for execution. 
+
+		dwWait = WaitForSingleObjectEx(
+			hConnectEvent,  // event object to wait for 
+			INFINITE,       // waits indefinitely 
+			TRUE);          // alertable wait enabled 
+
+		switch (dwWait)
+		{
+			// The wait conditions are satisfied by a completed connect 
+			// operation. 
+		case 0:
+			// If an operation is pending, get the result of the 
+			// connect operation. 
+
+			if (fPendingIO)
+			{
+				fSuccess = GetOverlappedResult(
+					hPipe,     // pipe handle 
+					&oConnect, // OVERLAPPED structure 
+					&cbRet,    // bytes transferred 
+					FALSE);    // does not wait 
+				if (!fSuccess)
+				{
+					fatal("ConnectNamedPipe (%d)", GetLastError());
+				}
+			}
+
+			// Allocate storage for this instance. 
+
+			lpPipeInst = (LPPIPEINST)HeapAlloc(GetProcessHeap(),
+				HEAP_ZERO_MEMORY, sizeof(PIPEINST));
+			if (lpPipeInst == NULL)
+			{
+				fatal("GlobalAlloc failed (%d)", GetLastError());
+			}
+
+			lpPipeInst->hPipeInst = hPipe;
+
+			// Start the read operation for this client. 
+			// Note that this same routine is later used as a 
+			// completion routine after a write operation. 
+
+			CompletedWriteRoutine(0, 0, (LPOVERLAPPED)lpPipeInst);
+
+			// Create new pipe instance for the next client. 
+
+			fPendingIO = CreateAndConnectInstance(
+				&oConnect);
+			break;
+
+			// The wait is satisfied by a completed read or write 
+			// operation. This allows the system to execute the 
+			// completion routine. 
+
+		case WAIT_IO_COMPLETION:
+			break;
+
+			// An error occurred in the wait function. 
+
+		default:
+		{
+			fatal("WaitForSingleObjectEx (%d)", GetLastError());
 		}
-
-		if (GetLastError() == ERROR_PIPE_CONNECTED) {
-			debug("Client has already connected");
-			SetEvent(ol.hEvent);
-		} else if (GetLastError() != ERROR_IO_PENDING) {
-			debug("ConnectNamedPipe failed ERROR: %d", GetLastError());
-			SetEvent(event_stop_agent);
-		}
-
-		r = WaitForMultipleObjects(2, wait_events, FALSE, INFINITE);
-		if (r == WAIT_OBJECT_0) {
-			/*received signal to shutdown*/
-			debug("shutting down");
-			agent_cleanup();
-			return;
-		} else if ((r > WAIT_OBJECT_0) && (r <= (WAIT_OBJECT_0 + 1))) {
-			/* process incoming connection */
-			HANDLE con = pipe;
-			DWORD client_pid = 0;
-			pipe = INVALID_HANDLE_VALUE;
-			GetNamedPipeClientProcessId(con, &client_pid);
-			verbose("client pid %d connected", client_pid);
-			//	/* spawn a child to take care of this*/
-			CreateThread(NULL, 0, agent_process_connection, con, 0, NULL);
-			debug("spawned worker for agent client pid %d ", client_pid);
-			//}
-		} else {
-			fatal("wait on events ended with %d ERROR:%d", r, GetLastError());
 		}
 	}
 }
 
-void 
-agent_cleanup_connection(struct agent_connection* con) 
+// CompletedWriteRoutine(DWORD, DWORD, LPOVERLAPPED) 
+// This routine is called as a completion routine after writing to 
+// the pipe, or when a new client has connected to a pipe instance.
+// It starts another read operation. 
+VOID WINAPI CompletedWriteRoutine(DWORD dwErr, DWORD cbWritten,
+	LPOVERLAPPED lpOverLap)
 {
-	debug("connection %p clean up", con);
-	CloseHandle(con->pipe_handle);
-	if (con->client_impersonation_token)
-		CloseHandle(con->client_impersonation_token);
-	if (con->client_process_handle)
-		CloseHandle(con->client_process_handle);
-	if (con->iocp)
-		CloseHandle(con->iocp);
-	for (size_t i = 0; i < con->nsession_ids; i++) {
-		sshkey_free(con->session_ids[i].key);
-		sshbuf_free(con->session_ids[i].sid);
+	LPPIPEINST lpPipeInst = (LPPIPEINST)lpOverLap;
+	BOOL fRead = FALSE;
+
+	debug3("connection io write %p #bytes:%d", lpPipeInst, cbWritten);
+
+	// The write operation has finished, so read the next request (if 
+	// there is no error). 
+	SecureZeroMemory(lpPipeInst->chBuf, sizeof(lpPipeInst->chSize));
+
+	if ((dwErr == 0) && (cbWritten == lpPipeInst->chSize))
+		lpPipeInst->chSize = 0;
+		fRead = ReadFileEx(
+			lpPipeInst->hPipeInst,
+			lpPipeInst->chBuf,
+			MAX_MESSAGE_SIZE,
+			(LPOVERLAPPED)lpPipeInst,
+			(LPOVERLAPPED_COMPLETION_ROUTINE)CompletedReadRoutine);
+
+	// Disconnect if an error occurred. 
+	if (!fRead)
+		DisconnectAndClose(lpPipeInst);
+}
+
+// CompletedReadRoutine(DWORD, DWORD, LPOVERLAPPED) 
+// This routine is called as an I/O completion routine after reading 
+// a request from the client. It gets data and writes it to the pipe. 
+VOID WINAPI CompletedReadRoutine(DWORD dwErr, DWORD cbBytesRead,
+	LPOVERLAPPED lpOverLap)
+{
+	LPPIPEINST lpPipeInst = (LPPIPEINST)lpOverLap;
+	BOOL success = FALSE, readDone = FALSE;
+	int num_bytes;
+
+	debug3("connection io read %p #bytes:%d", lpPipeInst, cbBytesRead);
+
+	if ((dwErr == 0) && (cbBytesRead != 0))
+		lpPipeInst->chSize += cbBytesRead;
+
+	if (lpPipeInst->chSize > HEADER_SIZE)
+	{
+		num_bytes = PEEK_U32(lpPipeInst->chBuf);
+		if (num_bytes == lpPipeInst->chSize - HEADER_SIZE)
+			readDone = TRUE;
+		else if (num_bytes < lpPipeInst->chSize - HEADER_SIZE)
+			DisconnectAndClose(lpPipeInst);
 	}
-	free(con->session_ids);
-	con->nsession_ids = 0;
 
-	free(con);
+	if (readDone)
+	{
+		if (ProcessRequest(lpPipeInst) == 0)
+			success = WriteFileEx(
+				lpPipeInst->hPipeInst,
+				lpPipeInst->chBuf,
+				lpPipeInst->chSize,
+				(LPOVERLAPPED)lpPipeInst,
+				(LPOVERLAPPED_COMPLETION_ROUTINE)CompletedWriteRoutine);
+	}
+	else
+	{
+		success = ReadFileEx(
+			lpPipeInst->hPipeInst,
+			lpPipeInst->chBuf + lpPipeInst->chSize,
+			MAX_MESSAGE_SIZE - lpPipeInst->chSize,
+			(LPOVERLAPPED)lpPipeInst,
+			(LPOVERLAPPED_COMPLETION_ROUTINE)CompletedReadRoutine);
+	}
+
+	// Disconnect if an error occurred. 
+	if (!success)
+		DisconnectAndClose(lpPipeInst);
 }
 
-void 
-agent_shutdown() 
+// DisconnectAndClose(LPPIPEINST) 
+// This routine is called when an error occurs or the client closes 
+// its handle to the pipe. 
+
+VOID DisconnectAndClose(LPPIPEINST lpPipeInst)
 {
-	SetEvent(event_stop_agent);
+	// Disconnect the pipe instance. 
+
+	if (!DisconnectNamedPipe(lpPipeInst->hPipeInst))
+	{
+		error("DisconnectNamedPipe failed with %d.", GetLastError());
+	}
+
+	// Close the handle to the pipe instance. 
+
+	CloseHandle(lpPipeInst->hPipeInst);
+
+
+	// Release the storage for the pipe instance. 
+	debug("connection %p clean up", lpPipeInst);
+	for (size_t i = 0; i < lpPipeInst->nsession_ids; i++) {
+		sshkey_free(lpPipeInst->session_ids[i].key);
+		sshbuf_free(lpPipeInst->session_ids[i].sid);
+	}
+	free(lpPipeInst->session_ids);
+	lpPipeInst->nsession_ids = 0;
+
+	SecureZeroMemory(lpPipeInst, sizeof(lpPipeInst));
+
+	HeapFree(GetProcessHeap(), 0, lpPipeInst);
 }
+
+// CreateAndConnectInstance(LPOVERLAPPED) 
+// This function creates a pipe instance and connects to the client. 
+// It returns TRUE if the connect operation is pending, and FALSE if 
+// the connection has been completed. 
+
+BOOL CreateAndConnectInstance(LPOVERLAPPED lpoOverlap)
+{
+	hPipe = CreateNamedPipeW(
+		AGENT_PIPE_ID,            // pipe name 
+		PIPE_ACCESS_DUPLEX |      // read/write access 
+		FILE_FLAG_OVERLAPPED,     // overlapped mode 
+		PIPE_TYPE_BYTE |          // message-type pipe 
+		PIPE_READMODE_BYTE |      // message read mode 
+		PIPE_WAIT,                // blocking mode 
+		PIPE_UNLIMITED_INSTANCES, // unlimited instances 
+		BUFSIZE,				  // output buffer size 
+		BUFSIZE,				  // input buffer size 
+		0,						  // client time-out 
+		&sa);                     // default security attributes
+	if (hPipe == INVALID_HANDLE_VALUE)
+	{
+		fatal("CreateNamedPipe failed with %d.", GetLastError());
+	}
+
+	// Call a subroutine to connect to the new client. 
+	return ConnectToNewClient(hPipe, lpoOverlap);
+}
+
+BOOL ConnectToNewClient(HANDLE hPipe, LPOVERLAPPED lpo)
+{
+	BOOL fConnected, fPendingIO = FALSE;
+
+	// Start an overlapped connection for this pipe instance. 
+	fConnected = ConnectNamedPipe(hPipe, lpo);
+
+	// Overlapped ConnectNamedPipe should return zero. 
+	if (fConnected)
+	{
+		error("ConnectNamedPipe failed with %d.", GetLastError());
+		return 0;
+	}
+
+	switch (GetLastError())
+	{
+		// The overlapped connection in progress. 
+	case ERROR_IO_PENDING:
+		fPendingIO = TRUE;
+		break;
+
+		// Client is already connected, so signal an event. 
+
+	case ERROR_PIPE_CONNECTED:
+		if (SetEvent(lpo->hEvent))
+			break;
+
+		// If an error occurs during the connect operation... 
+	default:
+	{
+		error("ConnectNamedPipe failed with %d.", GetLastError());
+		return 0;
+	}
+	}
+	return fPendingIO;
+}
+
+static int
+ProcessRequest(LPPIPEINST con)
+{
+	int r = -1, num_bytes;
+	struct sshbuf* request = NULL, * response = NULL;
+	u_char type;
+	errno_t err = 0;
+
+	num_bytes = PEEK_U32(con->chBuf);
+	if (num_bytes != con->chSize - HEADER_SIZE)
+	{
+		debug("Invalid request");
+		return -1;
+	}
+
+	request = sshbuf_from(con->chBuf + HEADER_SIZE, con->chSize - HEADER_SIZE);
+	response = sshbuf_new();
+	if ((request == NULL) || (response == NULL))
+		goto done;
+
+	if (sshbuf_get_u8(request, &type) != 0)
+		return -1;
+	debug("process agent request type %d", type);
+
+	switch (type) {
+	case SSH_AGENTC_REQUEST_RSA_IDENTITIES:
+	case SSH_AGENTC_RSA_CHALLENGE:
+	case SSH_AGENTC_ADD_RSA_IDENTITY:
+	case SSH_AGENTC_REMOVE_RSA_IDENTITY:
+	case SSH_AGENTC_REMOVE_ALL_RSA_IDENTITIES:
+		r = process_unsupported_request(request, response, con);
+		break;
+	case SSH2_AGENTC_ADD_IDENTITY:
+		r = process_add_identity(request, response, con);
+		break;
+	case SSH2_AGENTC_REQUEST_IDENTITIES:
+		r = process_request_identities(request, response, con);
+		break;
+	case SSH2_AGENTC_SIGN_REQUEST:
+		r = process_sign_request(request, response, con);
+		break;
+	case SSH2_AGENTC_REMOVE_IDENTITY:
+		r = process_remove_key(request, response, con);
+		break;
+	case SSH2_AGENTC_REMOVE_ALL_IDENTITIES:
+		r = process_remove_all(request, response, con);
+		break;
+#ifdef ENABLE_PKCS11
+	case SSH_AGENTC_ADD_SMARTCARD_KEY:
+	case SSH_AGENTC_ADD_SMARTCARD_KEY_CONSTRAINED:
+		r = process_add_smartcard_key(request, response, con);
+		break;
+	case SSH_AGENTC_REMOVE_SMARTCARD_KEY:
+		r = process_remove_smartcard_key(request, response, con);
+		break;
+#endif /* ENABLE_PKCS11 */
+	case SSH_AGENTC_EXTENSION:
+		r = process_extension(request, response, con);
+		break;
+	default:
+		debug("unknown agent request %d", type);
+		r = -1;
+		break;
+	}
+
+done:
+	if (request)
+		sshbuf_free(request);
+
+	SecureZeroMemory(&con->chBuf, sizeof(con->chBuf));
+	if (r == 0) {
+		POKE_U32(con->chBuf, (u_int32_t)sshbuf_len(response));
+		if ((err = memcpy_s(con->chBuf + HEADER_SIZE, sizeof(con->chBuf) - HEADER_SIZE, sshbuf_ptr(response), sshbuf_len(response))) != 0) {
+			debug("memcpy_s failed with error: %d.", err);
+			r = -1;
+		}
+		con->chSize = (DWORD)sshbuf_len(response) + HEADER_SIZE;
+	}
+
+	if (response)
+		sshbuf_free(response);
+
+	return r;
+}
+
 
 void
 agent_start(BOOL dbg_mode) 
@@ -196,7 +436,6 @@ agent_start(BOOL dbg_mode)
 	sa.nLength = sizeof(sa);
 
 	idtab_init();
-	InitializeCriticalSection(&req_mutex);
 #ifdef ENABLE_PKCS11
 	pkcs11_init(0);
 #endif /* ENABLE_PKCS11 */
@@ -210,166 +449,7 @@ agent_start(BOOL dbg_mode)
 		fatal("cannot create agent root reg key, ERROR:%d", r);
 	if ((r = RegSetValueExW(agent_root, L"ProcessID", 0, REG_DWORD, (BYTE*)&process_id, 4)) != ERROR_SUCCESS)
 		fatal("cannot publish agent master process id ERROR:%d", r);
-	if ((event_stop_agent = CreateEvent(NULL, TRUE, FALSE, NULL)) == NULL)
-		fatal("cannot create global stop event ERROR:%d", GetLastError());
-	if ((ol.hEvent = CreateEvent(NULL, TRUE, FALSE, NULL)) == NULL)
-		fatal("cannot create event ERROR:%d", GetLastError());
-	pipe = INVALID_HANDLE_VALUE;
+	hPipe = INVALID_HANDLE_VALUE;
 	sa.bInheritHandle = FALSE;
-	agent_listen_loop();
-}
-
-static char*
-con_type_to_string(struct agent_connection* con)
-{
-	switch (con->client_type) {
-	case UNKNOWN:
-		return "unknown";
-	case NONADMIN_USER:
-		return "restricted user";
-	case ADMIN_USER:
-		return "administrator";
-	case SYSTEM:
-		return "system";
-	case SERVICE:
-		return "service";
-	default:
-		return "unexpected";
-	}
-}
-
-static int
-get_con_client_info(struct agent_connection* con, PHANDLE sshagent_client_primary_token)
-{
-	int r = -1;
-	char sid[SECURITY_MAX_SID_SIZE];
-	ULONG client_pid;
-	DWORD reg_dom_len = 0, info_len = 0, sid_size;
-	DWORD sshd_sid_len = 0;
-	PSID sshd_sid = NULL;
-	HANDLE client_primary_token = NULL, client_impersonation_token = NULL, client_process_handle = NULL;
-	TOKEN_USER* info = NULL;
-	BOOL isMember = FALSE;
-	char* sshagent_con_username = NULL;
-
-	if (GetNamedPipeClientProcessId(con->pipe_handle, &client_pid) == FALSE ||
-		(client_process_handle = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_DUP_HANDLE, FALSE, client_pid)) == NULL ||
-		OpenProcessToken(client_process_handle, TOKEN_QUERY | TOKEN_DUPLICATE, &client_primary_token) == FALSE ||
-		DuplicateToken(client_primary_token, SecurityImpersonation, &client_impersonation_token) == FALSE) {
-		error("cannot retrieve client impersonation token");
-		goto done;
-	}
-
-	if (GetTokenInformation(client_primary_token, TokenUser, NULL, 0, &info_len) == TRUE ||
-		(info = (TOKEN_USER*)malloc(info_len)) == NULL) // CodeQL [SM02320]: GetTokenInformation will initialize info
-		goto done;
-
-	if (GetTokenInformation(client_primary_token, TokenUser, info, info_len, &info_len) == FALSE)
-		goto done;
-
-	/* check if its localsystem */
-	if (IsWellKnownSid(info->User.Sid, WinLocalSystemSid)) {
-		con->client_type = SYSTEM;
-		r = 0;
-		goto done;
-	}
-
-	/* check if its LS or NS */
-	if (IsWellKnownSid(info->User.Sid, WinNetworkServiceSid) ||
-		IsWellKnownSid(info->User.Sid, WinLocalServiceSid)) {
-		con->client_type = SERVICE;
-		r = 0;
-		goto done;
-	}
-
-	// Get client primary token
-	if (DuplicateTokenEx(client_primary_token, TOKEN_QUERY | TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE, NULL, SecurityImpersonation, TokenPrimary, sshagent_client_primary_token) == FALSE) {
-		error_f("Failed to duplicate the primary token. error:%d", GetLastError());
-	}
-
-	// Get username
-	sshagent_con_username = get_username(info->User.Sid);
-	if (sshagent_con_username)
-		debug_f("sshagent_con_username: %s", sshagent_con_username);
-	else
-		error_f("Failed to get the userName");
-
-	/* check if its admin */
-	{
-		sid_size = SECURITY_MAX_SID_SIZE;
-		if (CreateWellKnownSid(WinBuiltinAdministratorsSid, NULL, sid, &sid_size) == FALSE)
-			goto done;
-		if (CheckTokenMembership(client_impersonation_token, sid, &isMember) == FALSE)
-			goto done;
-		if (isMember) {
-			con->client_type = ADMIN_USER;
-			r = 0;
-			goto done;
-		}
-	}
-
-	/* none of above */
-	con->client_type = NONADMIN_USER;
-	r = 0;
-done:
-	debug("client type: %s", con_type_to_string(con));
-	con->nsession_ids = 0;
-
-	if (sshd_sid)
-		free(sshd_sid);
-	if (info)
-		free(info);
-	if (client_primary_token)
-		CloseHandle(client_primary_token);
-	if (sshagent_con_username) {
-		free(sshagent_con_username);
-	}
-	if (r == 0) {
-		con->client_process_handle = client_process_handle;
-		con->client_impersonation_token = client_impersonation_token;
-	} else {
-		if (client_process_handle)
-			CloseHandle(client_process_handle);
-		if (client_impersonation_token)
-			CloseHandle(client_impersonation_token);
-	}
-
-	return r;
-}
-
-DWORD 
-agent_process_connection(LPVOID pipe) 
-{
-	struct agent_connection* con;
-	HANDLE sshagent_client_primary_token;
-	HANDLE ioc_port = NULL;
-
-	verbose("%s pipe:%p", __FUNCTION__, pipe);
-
-	if ((ioc_port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, NULL, (ULONG_PTR)NULL, 0)) == NULL)
-		fatal("cannot create ioc port ERROR:%d", GetLastError());
-
-	if ((con = malloc(sizeof(struct agent_connection))) == NULL)
-		fatal("failed to alloc");
-
-	memset(con, 0, sizeof(struct agent_connection));
-	con->pipe_handle = pipe;
-	if (CreateIoCompletionPort(pipe, ioc_port, (ULONG_PTR)con, 0) != ioc_port)
-		fatal("failed to assign pipe to ioc_port");
-
-	con->iocp = ioc_port;
-
-	/* get client details */
-	if (get_con_client_info(con, &sshagent_client_primary_token) == -1)
-		fatal("failed to retrieve client details");
-
-	agent_connection_on_io(con, 0, &con->ol);
-	iocp_work(ioc_port);
-
-#ifdef ENABLE_PKCS11
-	if (sshagent_client_primary_token)
-		CloseHandle(sshagent_client_primary_token);
-#endif
-
-	return 0;
+	ConnectionLoop();
 }
