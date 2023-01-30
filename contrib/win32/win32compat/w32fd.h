@@ -119,8 +119,6 @@ struct w32_io {
 		enum w32_io_sock_state state;
 		void* context;
 	}internal;
-
-	CRITICAL_SECTION mutex;
 };
 
 #define WINHANDLE(pio) ((pio)->handle)
