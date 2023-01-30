@@ -36,6 +36,8 @@ typedef struct
 	struct hostkey_sid* session_ids;
 } PIPEINST, * LPPIPEINST;
 
+extern HANDLE ghSvcStopEvent;
+
 void agent_start(BOOL dbg_mode);
 
 static VOID ConnectionLoop(VOID);

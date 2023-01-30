@@ -40,6 +40,8 @@
 
 #define AGENT_PIPE_ID L"\\\\.\\pipe\\openssh-ssh-agent"
 
+HANDLE ghSvcStopEvent = NULL;
+
 static SECURITY_ATTRIBUTES sa;
 
 static HANDLE hPipe;
@@ -55,6 +57,7 @@ ConnectionLoop()
 	LPPIPEINST lpPipeInst;
 	DWORD dwWait, cbRet;
 	BOOL fSuccess, fPendingIO;
+	HANDLE waitEvents[2];
 
 	wchar_t* sddl_str;
 	memset(&sa, 0, sizeof(SECURITY_ATTRIBUTES));
@@ -88,14 +91,19 @@ ConnectionLoop()
 	// the client to connect. 
 	fPendingIO = CreateAndConnectInstance(&oConnect);
 
+	waitEvents[0] = hConnectEvent;
+	waitEvents[1] = ghSvcStopEvent;
+
 	while (1)
 	{
 		// Wait for a client to connect, or for a read or write 
 		// operation to be completed, which causes a completion 
 		// routine to be queued for execution. 
 
-		dwWait = WaitForSingleObjectEx(
-			hConnectEvent,  // event object to wait for 
+		dwWait = WaitForMultipleObjectsEx(
+			2,
+			waitEvents,		// event object to wait for 
+			FALSE,			// wait for one
 			INFINITE,       // waits indefinitely 
 			TRUE);          // alertable wait enabled 
 
@@ -103,7 +111,7 @@ ConnectionLoop()
 		{
 			// The wait conditions are satisfied by a completed connect 
 			// operation. 
-		case 0:
+		case WAIT_OBJECT_0:
 			// If an operation is pending, get the result of the 
 			// connect operation. 
 
@@ -146,6 +154,10 @@ ConnectionLoop()
 			// The wait is satisfied by a completed read or write 
 			// operation. This allows the system to execute the 
 			// completion routine. 
+
+		case WAIT_OBJECT_0 + 1:
+			debug("shutting down");
+			return;
 
 		case WAIT_IO_COMPLETION:
 			break;
@@ -193,8 +205,8 @@ VOID WINAPI CompletedWriteRoutine(DWORD dwErr, DWORD cbWritten,
 // CompletedReadRoutine(DWORD, DWORD, LPOVERLAPPED) 
 // This routine is called as an I/O completion routine after reading 
 // a request from the client. It gets data and writes it to the pipe. 
-VOID WINAPI CompletedReadRoutine(DWORD dwErr, DWORD cbBytesRead,
-	LPOVERLAPPED lpOverLap)
+VOID WINAPI 
+CompletedReadRoutine(DWORD dwErr, DWORD cbBytesRead, LPOVERLAPPED lpOverLap)
 {
 	LPPIPEINST lpPipeInst = (LPPIPEINST)lpOverLap;
 	BOOL success = FALSE, readDone = FALSE;
@@ -246,16 +258,13 @@ VOID WINAPI CompletedReadRoutine(DWORD dwErr, DWORD cbBytesRead,
 VOID DisconnectAndClose(LPPIPEINST lpPipeInst)
 {
 	// Disconnect the pipe instance. 
-
 	if (!DisconnectNamedPipe(lpPipeInst->hPipeInst))
 	{
 		error("DisconnectNamedPipe failed with %d.", GetLastError());
 	}
 
 	// Close the handle to the pipe instance. 
-
 	CloseHandle(lpPipeInst->hPipeInst);
-
 
 	// Release the storage for the pipe instance. 
 	debug("connection %p clean up", lpPipeInst);
@@ -445,6 +454,8 @@ agent_start(BOOL dbg_mode)
 	if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl_str, SDDL_REVISION_1,
 	    &sa.lpSecurityDescriptor, &sa.nLength))
 		fatal("cannot convert sddl ERROR:%d", GetLastError());
+	if ((ghSvcStopEvent = CreateEvent(NULL, TRUE, FALSE, NULL)) == NULL)
+		fatal("cannot create global stop event ERROR:%d", GetLastError());
 	if ((r = RegCreateKeyExW(HKEY_LOCAL_MACHINE, SSH_AGENT_ROOT, 0, 0, 0, KEY_WRITE, &sa, &agent_root, 0)) != ERROR_SUCCESS)
 		fatal("cannot create agent root reg key, ERROR:%d", r);
 	if ((r = RegSetValueExW(agent_root, L"ProcessID", 0, REG_DWORD, (BYTE*)&process_id, 4)) != ERROR_SUCCESS)

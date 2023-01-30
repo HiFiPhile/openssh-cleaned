@@ -74,8 +74,9 @@ service_handler(DWORD dwControl)
 	switch (dwControl)
 	{
 	case SERVICE_CONTROL_STOP: {
+		ReportSvcStatus(SERVICE_STOP_PENDING, NO_ERROR, 0);
+		SetEvent(ghSvcStopEvent);
 		ReportSvcStatus(SERVICE_STOPPED, NO_ERROR, 0);
-		exit(0);
 		return;
 	}
 	case SERVICE_CONTROL_INTERROGATE:
