@@ -34,6 +34,8 @@
 
 #pragma warning(push, 3)
 
+CRITICAL_SECTION req_mutex;
+
 int process_request(struct agent_connection*);
 
 #define ABORT_CONNECTION_RETURN(c) do {	\
@@ -134,6 +136,8 @@ process_request(struct agent_connection* con)
 		return -1;
 	debug("process agent request type %d", type);
 
+	EnterCriticalSection(&req_mutex);
+
 	switch (type) {
 	case SSH_AGENTC_REQUEST_RSA_IDENTITIES:
 	case SSH_AGENTC_RSA_CHALLENGE:
@@ -174,6 +178,8 @@ process_request(struct agent_connection* con)
 		r = -1;
 		break;
 	}
+
+	LeaveCriticalSection(&req_mutex);
 
 done:
 	if (request)

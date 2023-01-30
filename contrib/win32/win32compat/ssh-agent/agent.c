@@ -36,7 +36,6 @@
 #include <pwd.h>
 
 #define BUFSIZE 5 * 1024
-static BOOL debug_mode = FALSE;
 
 #define AGENT_PIPE_ID L"\\\\.\\pipe\\openssh-ssh-agent"
 
@@ -44,6 +43,8 @@ static HANDLE              event_stop_agent;
 static OVERLAPPED          ol;
 static HANDLE              pipe;
 static SECURITY_ATTRIBUTES sa;
+
+extern CRITICAL_SECTION    req_mutex;
 
 extern void
 idtab_init(void);
@@ -144,10 +145,6 @@ agent_listen_loop()
 			pipe = INVALID_HANDLE_VALUE;
 			GetNamedPipeClientProcessId(con, &client_pid);
 			verbose("client pid %d connected", client_pid);
-			// if (debug_mode) {
-			// agent_process_connection(con);
-			/* termio doesn't work with multithread */
-			//} else {
 			//	/* spawn a child to take care of this*/
 			CreateThread(NULL, 0, agent_process_connection, con, 0, NULL);
 			debug("spawned worker for agent client pid %d ", client_pid);
@@ -194,12 +191,12 @@ agent_start(BOOL dbg_mode)
 	wchar_t* sddl_str;
 
 	verbose("%s pid:%d, dbg:%d", __FUNCTION__, process_id, dbg_mode);
-	debug_mode = dbg_mode;
 
 	memset(&sa, 0, sizeof(SECURITY_ATTRIBUTES));
 	sa.nLength = sizeof(sa);
 
 	idtab_init();
+	InitializeCriticalSection(&req_mutex);
 #ifdef ENABLE_PKCS11
 	pkcs11_init(0);
 #endif /* ENABLE_PKCS11 */
