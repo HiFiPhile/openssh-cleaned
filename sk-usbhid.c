@@ -794,12 +794,11 @@ key_lookup(fido_dev_t *dev, const char *application, const uint8_t *user_id,
 		skdebug(__func__, "fido_assert_new failed");
 		goto out;
 	}
-
 	/* generate an invalid signature on FIDO2 tokens */
 	if ((r = fido_assert_set_clientdata(assert, message,
-		sizeof(message))) != FIDO_OK) {
+	    sizeof(message))) != FIDO_OK) {
 		skdebug(__func__, "fido_assert_set_clientdata: %s",
-			fido_strerr(r));
+		    fido_strerr(r));
 		goto out;
 	}
 	if ((r = fido_assert_set_rp(assert, application)) != FIDO_OK) {
@@ -812,7 +811,7 @@ key_lookup(fido_dev_t *dev, const char *application, const uint8_t *user_id,
 	}
 	uv = FIDO_OPT_OMIT;
 	if (pin == NULL && check_sk_options(dev, "uv", &sk_supports_uv) == 0 &&
-		sk_supports_uv != -1)
+	    sk_supports_uv != -1)
 		uv = FIDO_OPT_TRUE;
 	if ((r = fido_assert_set_uv(assert, uv)) != FIDO_OK) {
 		skdebug(__func__, "fido_assert_set_uv: %s", fido_strerr(r));
@@ -826,8 +825,8 @@ key_lookup(fido_dev_t *dev, const char *application, const uint8_t *user_id,
 	skdebug(__func__, "%zu signatures returned", fido_assert_count(assert));
 	for (i = 0; i < fido_assert_count(assert); i++) {
 		if (fido_assert_user_id_len(assert, i) == user_id_len &&
-			memcmp(fido_assert_user_id_ptr(assert, i), user_id,
-				user_id_len) == 0) {
+		    memcmp(fido_assert_user_id_ptr(assert, i), user_id,
+		    user_id_len) == 0) {
 			skdebug(__func__, "credential exists");
 			r = FIDO_OK;
 			goto out;

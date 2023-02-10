@@ -1,4 +1,4 @@
-/* $OpenBSD: ssh-keygen.c,v 1.459 2022/08/11 01:56:51 djm Exp $ */
+/* $OpenBSD: ssh-keygen.c,v 1.461 2022/12/04 23:50:49 cheloha Exp $ */
 /*
  * Author: Tatu Ylonen <ylo@cs.hut.fi>
  * Copyright (c) 1994 Tatu Ylonen <ylo@cs.hut.fi>, Espoo, Finland
@@ -1995,7 +1995,7 @@ parse_cert_times(char *timespec)
 		cert_valid_to = parse_relative_time(to, now);
 	else if (strcmp(to, "forever") == 0)
 		cert_valid_to = ~(u_int64_t)0;
-	else if (strncmp(from, "0x", 2) == 0)
+	else if (strncmp(to, "0x", 2) == 0)
 		parse_hex_u64(to, &cert_valid_to);
 	else if (parse_absolute_time(to, &cert_valid_to) != 0)
 		fatal("Invalid to time \"%s\"", to);
@@ -3578,7 +3578,6 @@ main(int argc, char **argv)
 			else
 				fatal("Unsupported moduli option %s", optarg);
 			break;
-		case '?':
 		default:
 			usage();
 		}
@@ -3865,8 +3864,8 @@ main(int argc, char **argv)
 #else
 		passphrase = NULL;
 #endif
-		for (i = 0 ; ; i++) {
 		r = 0;
+		for (i = 0 ;;) {
 			if (!quiet) {
 				printf("You may need to touch your "
 				    "authenticator%s to authorize key "
