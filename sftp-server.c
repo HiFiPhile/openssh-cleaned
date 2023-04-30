@@ -56,9 +56,6 @@
 
 #include "sftp.h"
 #include "sftp-common.h"
-#ifdef WINDOWS
-#include "misc_internal.h"
-#endif // WINDOWS
 
 char *sftp_realpath(const char *, char *); /* sftp-realpath.c */
 
@@ -881,19 +878,6 @@ process_write(u_int32_t id)
 	    (r = sshbuf_get_u64(iqueue, &off)) != 0 ||
 	    (r = sshbuf_get_string(iqueue, &data, &len)) != 0)
 		fatal_fr(r, "parse");
-
-#ifdef WINDOWS
-	char* filepath = resolved_path_utf8(handle_to_name(handle));
-	if (filepath == NULL) {
-		debug("cannot convert handle %d to utf8 filepath for mark of the web", handle);
-	}
-	else {
-		if (add_mark_of_web(filepath) == -1) {
-			debug("add_mark_of_web to %s failed", filepath);
-		}
-		free(filepath);
-	}
-#endif // WINDOWS
 
 	debug("request %u: write \"%s\" (handle %d) off %llu len %zu",
 	    id, handle_to_name(handle), handle, (unsigned long long)off, len);
@@ -2099,10 +2083,6 @@ sftp_server_main(int argc, char **argv, struct passwd *user_pw)
 
 	logit("session opened for local user %s from [%s]",
 	    pw->pw_name, client_addr);
-
-#ifdef WINDOWS
-	get_zone_identifier(client_addr);
-#endif // WINDOWS
 
 	in = STDIN_FILENO;
 	out = STDOUT_FILENO;

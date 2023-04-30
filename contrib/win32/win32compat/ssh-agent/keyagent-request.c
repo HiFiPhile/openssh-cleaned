@@ -114,6 +114,64 @@ process_unsupported_request(struct sshbuf* request, struct sshbuf* response, LPP
 	return r;
 }
 
+static int
+parse_key_constraint_extension(struct sshbuf *m)
+{
+	char *ext_name = NULL, *skprovider = NULL;
+	int r;
+
+	if ((r = sshbuf_get_cstring(m, &ext_name, NULL)) != 0) {
+		error_fr(r, "parse constraint extension");
+		goto out;
+	}
+	debug_f("constraint ext %s", ext_name);
+	if (strcmp(ext_name, "sk-provider@openssh.com") == 0) {
+		if ((r = sshbuf_get_cstring(m, &skprovider, NULL)) != 0) {
+			error_fr(r, "parse %s", ext_name);
+			goto out;
+		}
+		if (strcmp(skprovider, "internal") != 0) {
+			error_f("unsupported sk-provider: %s", skprovider);
+			r = SSH_ERR_FEATURE_UNSUPPORTED;
+			goto out;
+		}
+	} else {
+		error_f("unsupported constraint \"%s\"", ext_name);
+		r = SSH_ERR_FEATURE_UNSUPPORTED;
+		goto out;
+	}
+	/* success */
+	r = 0;
+ out:
+	free(ext_name);
+	return r;
+}
+
+static int
+parse_key_constraints(struct sshbuf *m)
+{
+	int r;
+	u_char ctype;
+
+	while (sshbuf_len(m)) {
+		if ((r = sshbuf_get_u8(m, &ctype)) != 0) {
+			error("get constraint type returned %d", r);
+			return r;
+		}
+		switch (ctype) {
+		case SSH_AGENT_CONSTRAIN_EXTENSION:
+			if ((r = parse_key_constraint_extension(m)) != 0)
+				return r;
+			break;
+		default:
+			error("Unknown constraint %d", ctype);
+			return SSH_ERR_FEATURE_UNSUPPORTED;
+		}
+	}
+
+	return 0;
+}
+
 int
 process_add_identity(struct sshbuf* request, struct sshbuf* response, LPPIPEINST con) 
 {
@@ -128,6 +186,12 @@ process_add_identity(struct sshbuf* request, struct sshbuf* response, LPPIPEINST
 		(r = sshbuf_get_cstring(request, &comment, NULL)) != 0) {
 		error("key add request is invalid");
 		request_invalid = 1;
+		goto done;
+	}
+
+	if ((r = parse_key_constraints(request)) != 0) {
+		if (r != SSH_ERR_FEATURE_UNSUPPORTED)
+			request_invalid = 1;
 		goto done;
 	}
 
