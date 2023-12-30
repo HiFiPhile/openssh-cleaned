@@ -53,6 +53,14 @@ struct idtable {
 	TAILQ_HEAD(idqueue, identity) idlist;
 };
 
+extern int remote_add_provider;
+
+/* 
+ * get registry root where keys are stored 
+ * user keys are stored in user's hive
+ * while system keys (host keys) in HKLM
+ */
+
 /* private key table */
 struct idtable* idtab;
 
@@ -178,7 +186,7 @@ process_add_identity(struct sshbuf* request, struct sshbuf* response, LPPIPEINST
 	Identity* id;
 	struct sshkey* key = NULL;
 	int r = 0, request_invalid = 0, success = 0;
-	char *fp = NULL, *comment;
+	char *fp = NULL, *comment = NULL;
 
 	/* parse input request */
 	if ((r = sshkey_private_deserialize(request, &key)) != 0 ||
@@ -248,7 +256,7 @@ process_sign_request(struct sshbuf* request, struct sshbuf* response, LPPIPEINST
 	char* fp = NULL;
 	int r, request_invalid = 0, success = 0;
 	struct sshkey* key = NULL;
-	struct identity* id;
+	struct identity* id = NULL;
 	const char* sk_provider = NULL;
 
 	if (sshbuf_get_string_direct(request, &blob, &blen) != 0 ||
@@ -387,6 +395,12 @@ int process_add_smartcard_key(struct sshbuf* request, struct sshbuf* response, L
 		goto done;
 	}
 
+	if (con->nsession_ids != 0 && !remote_add_provider) {
+		verbose("failed PKCS#11 add of \"%.100s\": remote addition of "
+		    "providers is disabled", provider);
+		goto done;
+	}
+	
 	if (realpath(provider, canonical_provider) == NULL) {
 		error("failed PKCS#11 add of \"%.100s\": realpath: %s",
 			provider, strerror(errno));

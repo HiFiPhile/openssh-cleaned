@@ -37,6 +37,8 @@
 
 #pragma warning(push, 3)
 
+int remote_add_provider;
+
 int scm_start_service(DWORD, LPWSTR*);
 
 SERVICE_TABLE_ENTRYW dispatch_table[] =
@@ -107,11 +109,24 @@ fix_cwd()
 extern void sanitise_stdfd(void);
 
 int 
-wmain(int argc, wchar_t **argv) 
+wmain(int argc, wchar_t **wargv)
 {
 	_set_invalid_parameter_handler(invalid_parameter_handler);
 	w32posix_initialize();
 	fix_cwd();
+	/* Check if -Oallow-remote-pkcs11 has been passed in for all scenarios */
+	if (argc >= 2) {
+		for (int i = 0; i < argc; i++) {
+			if (wcsncmp(wargv[i], L"-O", 2) == 0) {
+				if (wcsncmp(wargv[i], L"-Oallow-remote-pkcs11", 21) == 0) {
+					remote_add_provider = 1;
+				}
+				else {
+					fatal("Unknown -O option; only allow-remote-pkcs11 is supported");
+				}
+			}
+		}
+	}
 	if (!StartServiceCtrlDispatcherW(dispatch_table)) {
 		if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
 			/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
@@ -122,15 +137,15 @@ wmain(int argc, wchar_t **argv)
 			 * Its either started in debug mode or a worker child 
 			 */
 			if (argc == 2) {
-				if (wcsncmp(argv[1], L"-ddd", 4) == 0)
+				if (wcsncmp(wargv[1], L"-ddd", 4) == 0)
 					log_init("ssh-agent", 7, 1, 1);
-				else if (wcsncmp(argv[1], L"-dd", 3) == 0)
+				else if (wcsncmp(wargv[1], L"-dd", 3) == 0)
 					log_init("ssh-agent", 6, 1, 1);
-				else if (wcsncmp(argv[1], L"-d", 2) == 0)
+				else if (wcsncmp(wargv[1], L"-d", 2) == 0)
 					log_init("ssh-agent", 5, 1, 1);
 
 				/* Set Ctrl+C handler if starting in debug mode */
-				if (wcsncmp(argv[1], L"-d", 2) == 0) {
+				if (wcsncmp(wargv[1], L"-d", 2) == 0) {
 					agent_start(TRUE);
 					return 0;
 				}
